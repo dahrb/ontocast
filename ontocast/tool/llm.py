@@ -42,9 +42,9 @@ import logging
 from functools import wraps
 from typing import Any, Callable, Type, TypeVar
 
-from langchain.output_parsers import PydanticOutputParser
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages.ai import AIMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
@@ -270,7 +270,9 @@ class LLMTool(Tool):
 
         # Generate new response
         prompt_str = self._prompt_to_string(prompt)
-        logger.debug(f"Cache miss, calling LLM for __call__: {prompt_str[:50]}...")
+        logger.debug(
+            f"Cache miss, calling LLM for __call__, prompt size {len(prompt_str[:50])}..."
+        )
 
         response = await self.llm.ainvoke(*args, **kwds)
 

@@ -1,28 +1,29 @@
 import logging
 import re
 import threading
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 from pydantic import Field
 
 from ontocast.config import ChunkConfig
 from ontocast.tool.cache import Cacher, ToolCacher
+from ontocast.tool.chunk.util import SENTENCE_SPLIT_REGEX, SemanticChunker
 from ontocast.tool.onto import Tool
 
-try:
-    import torch  # type: ignore
-    from langchain_huggingface import HuggingFaceEmbeddings
+logger = logging.getLogger(__name__)
 
-    from ontocast.tool.chunk.util import SemanticChunker
+# Optional imports for semantic chunking
+try:
+    import torch  # type: ignore[import-untyped]  # noqa: F401
+    from langchain_huggingface import (
+        HuggingFaceEmbeddings,  # type: ignore[import-untyped]  # noqa: F401
+    )
 
     SEMANTIC_CHUNKING_AVAILABLE = True
 except ImportError:
-    HuggingFaceEmbeddings = None  # type: ignore
-    torch = None  # type: ignore
-    SemanticChunker = None  # type: ignore
+    torch = None  # type: ignore[assignment]
+    HuggingFaceEmbeddings = None  # type: ignore[assignment, misc]
     SEMANTIC_CHUNKING_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 
 class ChunkerTool(Tool):
@@ -59,7 +60,7 @@ class ChunkerTool(Tool):
             **kwargs: Additional keyword arguments passed to the parent class.
         """
         super().__init__(**kwargs)
-        self._model = None
+        self._model: Union[Any, None, bool] = None  # type: ignore[assignment]
         self._model_lock = threading.Lock()  # Lock for thread-safe model initialization
 
         # Initialize cache - use shared cacher or create new one
@@ -96,7 +97,7 @@ class ChunkerTool(Tool):
         with self._model_lock:
             # Double-check: another thread might have initialized it while we waited
             if self._model is None and SEMANTIC_CHUNKING_AVAILABLE:
-                if HuggingFaceEmbeddings is not None:  # type: ignore
+                if HuggingFaceEmbeddings is not None:
                     try:
                         self._model = HuggingFaceEmbeddings(
                             model_name=self.model,
@@ -111,16 +112,16 @@ class ChunkerTool(Tool):
                     except Exception as e:
                         logger.error(f"Failed to initialize embedding model: {e}")
                         # Set to a sentinel value to prevent repeated failed attempts
-                        self._model = False  # type: ignore
+                        self._model = False
 
     def _naive_chunk(self, doc: str) -> list[str]:
         """Naive chunking fallback when semantic chunking is not available.
 
-                Args:
-                    doc: The document text to chunk.
-        git
-                Returns:
-                    List of text chunks.
+        Args:
+            doc: The document text to chunk.
+
+        Returns:
+            List of text chunks.
         """
         # Split by paragraphs first (double newlines)
         paragraphs = re.split(r"\n\s*\n", doc.strip())
@@ -199,7 +200,6 @@ class ChunkerTool(Tool):
             "chunking_mode": self.chunking_mode,
             "max_size": self.config.max_size,
             "min_size": self.config.min_size,
-            "buffer_size": self.config.buffer_size,
             "breakpoint_threshold_type": self.config.breakpoint_threshold_type,
             "breakpoint_threshold_amount": self.config.breakpoint_threshold_amount,
         }
@@ -229,45 +229,27 @@ class ChunkerTool(Tool):
                         "Model not initialized. Falling back to naive chunking."
                     )
                     result = self._naive_chunk(doc)
-                elif SemanticChunker is None:  # type: ignore
+                elif SemanticChunker is None:
                     logger.warning(
                         "SemanticChunker not available. Falling back to naive chunking."
                     )
                     result = self._naive_chunk(doc)
                 else:
                     text_splitter = SemanticChunker(
-                        buffer_size=self.config.buffer_size,
-                        breakpoint_threshold_type=self.config.breakpoint_threshold_type,
-                        breakpoint_threshold_amount=self.config.breakpoint_threshold_amount,
-                        embeddings=self._model,
-                        min_chunk_size=self.config.min_size,
-                        sentence_split_regex=r"(?:(?:\n{2,}(?=#+))|(?:\n{2,}(?=- ))"
-                        r"|(?<=[a-z][.?!])\s+(?=\b[A-Z]\w{8,}\b)|(?<!#)(?=#+))",
+                        embeddings=self._model,  # type: ignore[arg-type]
+                        chunk_config=self.config,
+                        sentence_split_regex=SENTENCE_SPLIT_REGEX,
                     )
 
-                    def recursive_chunking(docs_list: list[str], stop_flag=False):
-                        lens = [len(d) for d in docs_list]
-                        logger.info(f"chunk lengths: {lens}")
-                        if (
-                            all(len(d) < self.config.max_size for d in docs_list)
-                            or stop_flag
-                        ):
-                            return docs_list
-                        else:
-                            new_docs = []
-                            for d in docs_list:
-                                if len(d) > self.config.max_size:
-                                    cdocs_ = text_splitter.create_documents([d])
-                                    cdocs = [d.page_content for d in cdocs_]
-                                    if len(cdocs[-1]) < self.config.min_size:
-                                        cdocs = cdocs[:-2] + [cdocs[-2] + cdocs[-1]]
-                                    new_docs.extend(cdocs)
-                                else:
-                                    new_docs.append(d)
-                            stop_flag = len(docs_list) == len(new_docs)
-                            return recursive_chunking(new_docs, stop_flag=stop_flag)
+                    # SemanticChunker now handles max_size internally
+                    result_docs = text_splitter.create_documents(documents)
+                    result = [doc.page_content for doc in result_docs]
 
-                    result = recursive_chunking(documents)
+                    # Log chunk lengths for debugging
+                    lens = [len(chunk) for chunk in result]
+                    logger.info(
+                        f"Semantic chunking produced {len(result)} chunks with lengths: {lens}"
+                    )
 
         # Cache the result
         self.cache.set(doc, result, config=config_dict)
