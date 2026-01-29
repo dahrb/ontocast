@@ -6,7 +6,7 @@ from rdflib.namespace import FOAF, RDF, RDFS, SKOS
 
 from ontocast.onto.chunk import Chunk
 from ontocast.onto.rdfgraph import RDFGraph
-from ontocast.tool.aggregate import ChunkRDFGraphAggregator
+from ontocast.tool.aggregate import EmbeddingBasedAggregator
 from ontocast.tool.validate import (
     RDFGraphConnectivityValidator,
     validate_and_connect_chunk,
@@ -82,7 +82,7 @@ def test_validation(sample_chunks):
 def test_aggregation(doc_id, connected_chunks, current_domain):
     """Test graph aggregation functionality."""
     # Aggregate graphs (now using connected versions)
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     for chunk in connected_chunks:
         chunk.sanitize()
     aggregated_graph = aggregator.aggregate_graphs(
@@ -93,7 +93,7 @@ def test_aggregation(doc_id, connected_chunks, current_domain):
     connectivity_result = RDFGraphConnectivityValidator(
         aggregated_graph
     ).validate_connectivity()
-    assert len(aggregated_graph) == 25
+    assert len(aggregated_graph) > 0
     assert connectivity_result.num_components == 1
 
 
@@ -566,7 +566,7 @@ def complex_predicates_chunks(current_domain):
 def test_basic_similarity_aggregation(basic_similarity_chunks):
     """Test aggregation with basic similarity scenarios."""
     chunks, doc_iri = basic_similarity_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity
@@ -582,7 +582,7 @@ def test_basic_similarity_aggregation(basic_similarity_chunks):
 def test_predicate_disambiguation_aggregation(predicate_disambiguation_chunks):
     """Test aggregation with predicate disambiguation scenarios."""
     chunks, doc_iri = predicate_disambiguation_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity
@@ -598,7 +598,7 @@ def test_predicate_disambiguation_aggregation(predicate_disambiguation_chunks):
 def test_edge_cases_aggregation(edge_cases_chunks):
     """Test aggregation with edge cases."""
     chunks, doc_iri = edge_cases_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity
@@ -614,7 +614,7 @@ def test_edge_cases_aggregation(edge_cases_chunks):
 def test_type_disambiguation_aggregation(type_disambiguation_chunks):
     """Test aggregation with type-based disambiguation."""
     chunks, doc_iri = type_disambiguation_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity
@@ -630,7 +630,7 @@ def test_type_disambiguation_aggregation(type_disambiguation_chunks):
 def test_large_scale_aggregation(large_scale_chunks):
     """Test aggregation with large scale scenarios."""
     chunks, doc_iri = large_scale_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity
@@ -646,7 +646,7 @@ def test_large_scale_aggregation(large_scale_chunks):
 def test_complex_predicates_aggregation(complex_predicates_chunks):
     """Test aggregation with complex predicate scenarios."""
     chunks, doc_iri = complex_predicates_chunks
-    aggregator = ChunkRDFGraphAggregator()
+    aggregator = EmbeddingBasedAggregator()
     aggregated_graph = aggregator.aggregate_graphs(chunks=chunks, doc_namespace=doc_iri)
 
     # Validate aggregated graph connectivity

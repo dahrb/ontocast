@@ -60,7 +60,7 @@ class ConverterTool(Tool):
             self.cache = ToolCacher(shared_cache, "converter")
 
         try:
-            from docling.document_converter import (  # type: ignore[import-untyped]
+            from docling.document_converter import (
                 DocumentConverter,
             )
 
@@ -102,7 +102,7 @@ class ConverterTool(Tool):
                 if self._converter is None:
                     raise ImportError("DocumentConverter not available")
                 try:
-                    from docling.datamodel.base_models import (  # type: ignore[import-untyped]
+                    from docling.datamodel.base_models import (
                         DocumentStream,
                     )
 

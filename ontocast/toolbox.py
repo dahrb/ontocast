@@ -15,7 +15,7 @@ from ontocast.tool import (
     FusekiTripleStoreManager,
     Neo4jTripleStoreManager,
 )
-from ontocast.tool.aggregate import ChunkRDFGraphAggregator
+from ontocast.tool.aggregate import EmbeddingBasedAggregator
 from ontocast.tool.cache import Cacher
 from ontocast.tool.graph_diff import DiffTool
 from ontocast.tool.graph_version_manager import GraphVersionManager
@@ -140,7 +140,7 @@ class ToolBox:
         self.chunker: ChunkerTool = ChunkerTool(
             chunk_config=tool_config.chunk_config, cache=self.shared_cache
         )
-        self.aggregator: ChunkRDFGraphAggregator = ChunkRDFGraphAggregator()
+        self.aggregator: EmbeddingBasedAggregator = EmbeddingBasedAggregator()
 
         # SPARQL, version management, and diff tools
         self.sparql_tool: SPARQLTool = SPARQLTool(

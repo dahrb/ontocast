@@ -359,7 +359,7 @@ def real_embeddings() -> Optional["HuggingFaceEmbeddings"]:
     """
 
     try:
-        import torch  # ty: ignore[unresolved-import]
+        import torch
         from langchain_huggingface import HuggingFaceEmbeddings
 
         embeddings = HuggingFaceEmbeddings(
