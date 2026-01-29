@@ -359,7 +359,7 @@ def real_embeddings() -> Optional["HuggingFaceEmbeddings"]:
     """
 
     try:
-        import torch
+        import torch  # ty: ignore[unresolved-import]
         from langchain_huggingface import HuggingFaceEmbeddings
 
         embeddings = HuggingFaceEmbeddings(
@@ -505,6 +505,65 @@ def long_text():
             )
         paragraphs.append(" ".join(sentences))
     return "\n\n".join(paragraphs)
+
+
+# --- Aggregator test fixtures (used by test_aggregator.py) ---
+
+
+@pytest.fixture
+def ontology_ns():
+    """Ontology namespace set for EntityNormalizer."""
+    return {"http://ontology.org/"}
+
+
+@pytest.fixture
+def normalizer(ontology_ns):
+    """EntityNormalizer instance for aggregator tests."""
+    from ontocast.tool.agg.normalizer import EntityNormalizer
+
+    return EntityNormalizer(ontology_ns)
+
+
+@pytest.fixture
+def cluster_representative_selector():
+    """ClusterRepresentativeSelector instance for aggregator tests."""
+    from ontocast.tool.agg.clustering import ClusterRepresentativeSelector
+
+    return ClusterRepresentativeSelector()
+
+
+@pytest.fixture
+def doc_namespace():
+    """Document namespace for URIPromoter."""
+    return "http://doc.org/"
+
+
+@pytest.fixture
+def chunk_namespaces():
+    """Chunk namespaces for URIPromoter."""
+    return {"http://chunk1.org/", "http://chunk2.org/"}
+
+
+@pytest.fixture
+def ontology_namespaces():
+    """Ontology namespaces for URIPromoter."""
+    return {"http://ontology.org/"}
+
+
+@pytest.fixture
+def promoter(doc_namespace, chunk_namespaces, ontology_namespaces):
+    """URIPromoter instance for aggregator tests."""
+    from ontocast.tool.agg.promoter import URIPromoter
+
+    return URIPromoter(doc_namespace, chunk_namespaces, ontology_namespaces)
+
+
+@pytest.fixture
+def graph_rewriter():
+    """GraphRewriter instance for aggregator tests (add_sameas_links=True)."""
+    from ontocast.tool.agg.rewriter import GraphRewriter
+
+    return GraphRewriter(add_sameas_links=True)
 
 
 def triple_store_roundtrip(manager, test_ontology):

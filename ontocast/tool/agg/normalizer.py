@@ -9,7 +9,6 @@ It creates normalized string representations r(e) that include:
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Optional
 
 from rdflib import RDF, RDFS, Literal, URIRef
 
@@ -46,7 +45,7 @@ class EntityNormalizer:
     string representations that can be embedded and compared.
     """
 
-    def __init__(self, ontology_namespaces: Optional[set[str]] = None):
+    def __init__(self, ontology_namespaces: set[str] | None = None):
         """Initialize the entity normalizer.
 
         Args:
@@ -58,6 +57,9 @@ class EntityNormalizer:
     def normalize_string(self, text: str) -> str:
         """Normalize a string: lowercase, remove diacritics, clean special chars.
 
+        CamelCase is split so that it yields the same logical tokens as snake_case
+        (e.g. 'PLRedShift' -> 'pl red shift').
+
         Args:
             text: Input string to normalize
 
@@ -65,7 +67,7 @@ class EntityNormalizer:
             Normalized string suitable for comparison
 
         Examples:
-            'PLRedShift' -> 'plredshift'
+            'PLRedShift' -> 'pl red shift'
             'PL_red_shift_value' -> 'pl red shift value'
             'Café' -> 'cafe'
         """
@@ -76,16 +78,18 @@ class EntityNormalizer:
             if unicodedata.category(c) != "Mn"
         )
 
+        # Insert space before capitals that start a word (followed by lowercase)
+        # so e.g. PLRedShift -> PL Red Shift -> pl red shift (like snake_case)
+        text = re.sub(r"(?=[A-Z][a-z])", " ", text)
+
         # Convert to lowercase
         text = text.lower()
 
         # Replace underscores and hyphens with spaces
         text = text.replace("_", " ").replace("-", " ")
 
-        # Insert spaces before capitals in camelCase (already lowercase, so won't trigger)
-        # But we should do this before lowercasing
-        # Let's handle this properly
-        return text.strip()
+        # Collapse multiple spaces and strip
+        return re.sub(r"\s+", " ", text).strip()
 
     def normalize_uri(self, uri: URIRef) -> str:
         """Extract and normalize the local part of a URI.
@@ -97,7 +101,7 @@ class EntityNormalizer:
             Normalized local name
 
         Examples:
-            'http://example.org/PLRedShift' -> 'plredshift'
+            'http://example.org/PLRedShift' -> 'pl red shift'
             'http://example.org/PL_red_shift_value' -> 'pl red shift value'
         """
         uri_str = str(uri)

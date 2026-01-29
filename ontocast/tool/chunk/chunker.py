@@ -14,14 +14,14 @@ logger = logging.getLogger(__name__)
 
 # Optional imports for semantic chunking
 try:
-    import torch
+    import torch  # type: ignore[import-untyped]  # noqa: F401
     from langchain_huggingface import (
-        HuggingFaceEmbeddings,
+        HuggingFaceEmbeddings,  # noqa: F401
     )
 
     SEMANTIC_CHUNKING_AVAILABLE = True
 except ImportError:
-    torch = None  # type: ignore[assignment]
+    torch = None
     HuggingFaceEmbeddings = None  # type: ignore[assignment, misc]
     SEMANTIC_CHUNKING_AVAILABLE = False
 
@@ -37,7 +37,6 @@ class ChunkerTool(Tool):
         default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         description="HuggingFace model name for embeddings",
     )
-
     config: ChunkConfig = Field(
         default_factory=ChunkConfig, description="Chunking configuration parameters"
     )

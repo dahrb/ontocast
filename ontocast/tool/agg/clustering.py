@@ -4,12 +4,12 @@ This module handles the embedding and clustering of entity representations
 to identify groups of similar entities.
 """
 
+import importlib
 import logging
-from typing import Optional
+from typing import Any
 
 import numpy as np
 from rdflib import URIRef
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import DBSCAN
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -41,14 +41,20 @@ class EntityClusterer:
         self.embedding_model = embedding_model
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
-        self._embedder: Optional[SentenceTransformer] = None
+        self._embedder: Any | None = None
 
     @property
-    def embedder(self) -> SentenceTransformer:
-        """Lazy load the embedding model."""
+    def embedder(self) -> Any:
         if self._embedder is None:
-            logger.info(f"Loading embedding model: {self.embedding_model}")
-            self._embedder = SentenceTransformer(self.embedding_model)
+            try:
+                st = importlib.import_module("sentence_transformers")
+            except ImportError as e:
+                raise ImportError(
+                    "Entity clustering requires the sentence-transformers package. "
+                    "Install it with: uv add sentence-transformers"
+                ) from e
+
+            self._embedder = st.SentenceTransformer(self.embedding_model)
         return self._embedder
 
     def embed_representations(
