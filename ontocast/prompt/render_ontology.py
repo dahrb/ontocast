@@ -1,3 +1,5 @@
+from ontocast.onto.constants import DEFAULT_IRI
+
 template_prompt = """
 {preamble}
 
@@ -12,6 +14,8 @@ template_prompt = """
 {ontology_ttl}
 
 {text}
+
+{external_evidence}
 
 {output_instruction}
 
@@ -30,14 +34,14 @@ Update/modify the domain ontology {ontology_iri} provided below with abstract en
 
 {ontology_desc}
 
-Feel free to update the description of the ontology to make it more accurate and complete, do not change neither ontology IRI nor predix nor id.
+Feel free to update the description of the ontology to make it more accurate and complete, do not change ontology IRI, prefix, or ontology_id.
 """
 
 prefix_instruction = """Use prefix `{ontology_prefix}` for entities/properties placed in the current domain ontology. DECLARE the prefix in preamble!"""
 prefix_instruction_fresh = """Define a new prefix for the current domain ontology. DECLARE the prefix in preamble!"""
 
 
-general_ontology_instruction = """
+general_ontology_instruction = f"""
 ### GENERAL
 
 1. **Only model abstract concepts — no instances or facts from the document** (e.g., no specific case names, dates, or people).
@@ -72,7 +76,21 @@ general_ontology_instruction = """
 
 8. **For measurable properties, specify units using schema:unitCode, rdfs:comment, or explicit unit classes** (e.g., `schema:duration schema:unitCode "DAY"` or `time:numericDuration rdfs:comment "Duration measured in days"`).
 
-9. **When introducing entities from other domain ontologies, declare their namespace prefixes** (e.g., `@prefix foaf: <http://xmlns.com/foaf/0.1/> .` or `@prefix dcterms: <http://purl.org/dc/terms/> .`).
+9. **Never model ontology classes/properties under `cd:`.** The `cd:` namespace (`{DEFAULT_IRI}`) is reserved for factual instances only.
+
+10. **When introducing entities from other domain ontologies, declare their namespace prefixes** (e.g., `@prefix foaf: <http://xmlns.com/foaf/0.1/> .` or `@prefix dcterms: <http://purl.org/dc/terms/> .`).
+
+11. **External evidence is optional and advisory**:
+   - Use web evidence only to resolve ambiguity, terminology, standards, or domain conventions.
+   - If external snippets conflict with source text or ontology context, prioritize source text and ontology context.
+   - Avoid adding entities/relations that are only weakly supported by web snippets.
+
+12. **Search decision output**:
+   - Include `external_evidence_request` in your structured response.
+   - Set `initiate_search=true` only when web evidence is necessary to resolve uncertainty
+     before a better retry can be produced.
+   - Otherwise keep `initiate_search=false`.
+   - When true, provide short `rationale` and optional focused `query_hints`.
 """
 
 

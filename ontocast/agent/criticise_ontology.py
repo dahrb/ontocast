@@ -11,7 +11,7 @@ from langchain_core.prompts import PromptTemplate
 from ontocast.agent.common import call_llm_with_retry
 from ontocast.onto.enum import FailureStage, Status, WorkflowNode
 from ontocast.onto.model import OntologyCritiqueReport, Suggestions
-from ontocast.onto.state import AgentState
+from ontocast.onto.unit_states import UnitOntologyState
 from ontocast.prompt.common import ontology_template, text_template
 from ontocast.prompt.common import system_preamble_ontology as system_preamble
 from ontocast.prompt.criticise_ontology import (
@@ -20,61 +20,68 @@ from ontocast.prompt.criticise_ontology import (
     template_prompt,
 )
 from ontocast.tool import LLMTool
-from ontocast.toolbox import ToolBox
+from ontocast.tool.atomic import AtomicToolBox
 
 logger = logging.getLogger(__name__)
 
 
-async def criticise_ontology(state: AgentState, tools: ToolBox) -> AgentState:
+async def criticise_ontology(
+    state: UnitOntologyState, tools: AtomicToolBox
+) -> UnitOntologyState:
     """Enhanced ontology criticism with SPARQL operations.
 
     This function performs a critical analysis of the ontology in the current
     state, with SPARQL operation support.
 
     Args:
-        state: The current agent state containing the ontology to analyze.
+        state: The current unit ontology state containing the ontology to analyze.
         tools: The toolbox instance providing utility functions.
 
     Returns:
-        AgentState: Updated state with analysis results.
+        UnitOntologyState: Updated state with analysis results.
     """
 
-    progress_info = state.get_chunk_progress_string()
+    progress_info = state.get_content_unit_progress_string()
     logger.info(
-        f"Ontology Critic for {progress_info}: visit {state.node_visits[WorkflowNode.CRITICISE_ONTOLOGY] + 1}/{state.max_visits}"
+        f"Ontology Critic for {progress_info}: visit {state.node_visits[WorkflowNode.CRITICISE_ONTOLOGY]}/{state.max_visits_per_node}"
     )
 
-    if state.current_chunk is None:
+    if state.content_unit is None:
         state.status = Status.FAILED
         return state
 
-    if state.current_ontology.is_null():
+    current = state.current_ontology or state.ontology_snapshot
+    if current.is_null():
         raise ValueError(
-            f"Null ontology cannot be criticised: {state.current_ontology.iri} is not a valid ontology"
+            f"Null ontology cannot be criticised: {current.iri} is not a valid ontology"
         )
 
     parser = PydanticOutputParser(pydantic_object=OntologyCritiqueReport)
     llm_tool: LLMTool = await tools.get_llm_tool(state.budget_tracker)
 
-    ontology_ttl = state.current_ontology.graph.serialize(format="turtle")
+    ontology_ttl = current.graph.serialize(format="turtle")
 
     ontology_chapter = ontology_template.format(
         ontology_ttl=ontology_ttl,
     )
 
-    text_chapter = text_template.format(text=state.current_chunk.text)
+    text_chapter = text_template.format(text=state.content_unit.text)
 
     user_instruction = state.ontology_user_instruction
+    external_evidence = state.external_evidence_text
+    if external_evidence:
+        state.mark_external_evidence_used(WorkflowNode.CRITICISE_ONTOLOGY)
 
     prompt = PromptTemplate(
         template=template_prompt,
         input_variables=[
             "preamble",
-            "facts_instruction",
-            "ontology_instruction",
+            "intro_instruction",
+            "ontology_criteria",
             "user_instruction",
+            "ontology_chapter",
             "text_chapter",
-            "improvement_instruction",
+            "external_evidence",
             "format_instructions",
         ],
     )
@@ -91,8 +98,12 @@ async def criticise_ontology(state: AgentState, tools: ToolBox) -> AgentState:
                 "text_chapter": text_chapter,
                 "user_instruction": user_instruction,
                 "ontology_chapter": ontology_chapter,
+                "external_evidence": external_evidence,
                 "format_instructions": parser.get_format_instructions(),
             },
+        )
+        state.set_external_evidence_request(
+            WorkflowNode.CRITICISE_ONTOLOGY, critique.external_evidence_request
         )
         logger.info(
             f"Parsed critique report - success: {critique.success}, "

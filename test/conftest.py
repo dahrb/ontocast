@@ -1,6 +1,6 @@
 """Pytest configuration for test suite."""
 
-import hashlib
+import importlib
 import json
 import logging
 import os
@@ -142,11 +142,6 @@ def tsm_tool(ontology_path, working_directory):
 
 
 @pytest.fixture
-def om_tool_fname():
-    return "test/data/om_tool.json"
-
-
-@pytest.fixture
 def tools(
     ontology_path,
     working_directory,
@@ -201,18 +196,8 @@ def tools(
 
 
 @pytest.fixture
-def state_chunked_filename():
-    return "test/data/state_chunked.json"
-
-
-@pytest.fixture
 def state_chunked(state_chunked_filename):
     return AgentState.load(state_chunked_filename)
-
-
-@pytest.fixture
-def state_onto_selected_filename():
-    return "test/data/state_ontology_selected.json"
 
 
 @pytest.fixture
@@ -221,18 +206,8 @@ def state_ontology_selected(state_onto_selected_filename):
 
 
 @pytest.fixture
-def state_ontology_rendered_filename():
-    return "test/data/state_onto_rendered.json"
-
-
-@pytest.fixture
 def state_ontology_rendered(state_ontology_rendered_filename):
     return AgentState.load(state_ontology_rendered_filename)
-
-
-@pytest.fixture
-def state_ontology_criticized_filename():
-    return "test/data/state_onto_criticized.json"
 
 
 @pytest.fixture
@@ -241,18 +216,8 @@ def state_ontology_criticized(state_ontology_criticized_filename):
 
 
 @pytest.fixture
-def state_rendered_facts_filename():
-    return "test/data/state_rendered_facts.json"
-
-
-@pytest.fixture
 def state_rendered_facts(state_rendered_facts_filename):
     return AgentState.load(state_rendered_facts_filename)
-
-
-@pytest.fixture
-def state_sublimated_filename():
-    return "test/data/state_sublimated.json"
 
 
 @pytest.fixture
@@ -261,28 +226,13 @@ def state_sublimated(state_sublimated_filename):
 
 
 @pytest.fixture
-def state_facts_failed_filename():
-    return "test/data/state_facts_failed.json"
-
-
-@pytest.fixture
 def state_facts_failed(state_facts_failed_filename):
     return AgentState.load(state_facts_failed_filename)
 
 
 @pytest.fixture
-def state_facts_success_filename():
-    return "test/data/state_facts_success.json"
-
-
-@pytest.fixture
 def state_facts_success(state_facts_success_filename):
     return AgentState.load(state_facts_success_filename)
-
-
-@pytest.fixture
-def state_onto_null_filename():
-    return "test/data/state_null_ontology_selected.json"
 
 
 @pytest.fixture
@@ -317,11 +267,6 @@ def random_report():
 @pytest.fixture
 def agent_state_onto_fresh():
     return AgentState.load("test/data/state_onto_addendum.json")
-
-
-@pytest.fixture
-def agent_state_onto_critique_success():
-    return AgentState.load("test/data/agent_state.onto.null.critique.success.json")
 
 
 @pytest.fixture(scope="session")
@@ -359,7 +304,7 @@ def real_embeddings() -> Optional["HuggingFaceEmbeddings"]:
     """
 
     try:
-        import torch  # ty: ignore[unresolved-import]
+        torch = importlib.import_module("torch")
         from langchain_huggingface import HuggingFaceEmbeddings
 
         embeddings = HuggingFaceEmbeddings(
@@ -411,8 +356,9 @@ def mock_embeddings():
             if text in self._cache:
                 return self._cache[text]
 
-            hash_obj = hashlib.md5(text.encode())
-            hash_int = int(hash_obj.hexdigest(), 16)
+            from ontocast.util import render_text_hash
+
+            hash_int = int(render_text_hash(text, digits=None), 16)
 
             embedding = []
             for i in range(self.embedding_dim):
@@ -511,17 +457,11 @@ def long_text():
 
 
 @pytest.fixture
-def ontology_ns():
-    """Ontology namespace set for EntityNormalizer."""
-    return {"http://ontology.org/"}
-
-
-@pytest.fixture
-def normalizer(ontology_ns):
+def normalizer():
     """EntityNormalizer instance for aggregator tests."""
     from ontocast.tool.agg.normalizer import EntityNormalizer
 
-    return EntityNormalizer(ontology_ns)
+    return EntityNormalizer()
 
 
 @pytest.fixture
@@ -533,29 +473,11 @@ def cluster_representative_selector():
 
 
 @pytest.fixture
-def doc_namespace():
-    """Document namespace for URIPromoter."""
-    return "http://doc.org/"
+def uri_builder():
+    """URIBuilder instance for aggregator tests."""
+    from ontocast.tool.agg.uri_builder import URIBuilder
 
-
-@pytest.fixture
-def chunk_namespaces():
-    """Chunk namespaces for URIPromoter."""
-    return {"http://chunk1.org/", "http://chunk2.org/"}
-
-
-@pytest.fixture
-def ontology_namespaces():
-    """Ontology namespaces for URIPromoter."""
-    return {"http://ontology.org/"}
-
-
-@pytest.fixture
-def promoter(doc_namespace, chunk_namespaces, ontology_namespaces):
-    """URIPromoter instance for aggregator tests."""
-    from ontocast.tool.agg.promoter import URIPromoter
-
-    return URIPromoter(doc_namespace, chunk_namespaces, ontology_namespaces)
+    return URIBuilder()
 
 
 @pytest.fixture
@@ -563,7 +485,7 @@ def graph_rewriter():
     """GraphRewriter instance for aggregator tests (add_sameas_links=True)."""
     from ontocast.tool.agg.rewriter import GraphRewriter
 
-    return GraphRewriter(add_sameas_links=True)
+    return GraphRewriter(add_sameas_links=False)
 
 
 def triple_store_roundtrip(manager, test_ontology):

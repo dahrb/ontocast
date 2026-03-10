@@ -12,7 +12,7 @@ from langchain_core.prompts import PromptTemplate
 from ontocast.agent.common import call_llm_with_retry
 from ontocast.onto.enum import FailureStage, Status, WorkflowNode
 from ontocast.onto.model import FactsCritiqueReport, Suggestions
-from ontocast.onto.state import AgentState
+from ontocast.onto.unit_states import UnitFactsState
 from ontocast.prompt.common import (
     facts_template,
     ontology_template,
@@ -24,49 +24,51 @@ from ontocast.prompt.criticise_facts import (
     preamble,
     template_prompt,
 )
-from ontocast.toolbox import ToolBox
+from ontocast.tool.atomic import AtomicToolBox
 
 logger = logging.getLogger(__name__)
 
 
-async def criticise_facts(state: AgentState, tools: ToolBox) -> AgentState:
+async def criticise_facts(
+    state: UnitFactsState, tools: AtomicToolBox
+) -> UnitFactsState:
     """Enhanced criticize facts with SPARQL operations.
 
-    This function performs a critical analysis of the facts in the current chunk,
+    This function performs a critical analysis of the facts in the current content unit,
     with SPARQL operation support.
 
     Args:
-        state: The current agent state containing the chunk to analyze.
+        state: The current unit facts state containing the chunk to analyze.
         tools: The toolbox instance providing utility functions.
 
     Returns:
-        AgentState: Updated state with analysis results.
+        UnitFactsState: Updated state with analysis results.
     """
-    if not state.current_chunk:
-        logger.warning("No current chunk to analyze")
+    if not state.content_unit:
+        logger.warning("No current content unit to analyze")
         return state
 
-    progress_info = state.get_chunk_progress_string()
+    progress_info = state.get_content_unit_progress_string()
     logger.info(
-        f"Facts critic for {progress_info}: visit {state.node_visits[WorkflowNode.CRITICISE_FACTS] + 1}/{state.max_visits}"
+        f"Facts critic for {progress_info}: visit {state.node_visits[WorkflowNode.CRITICISE_FACTS]}/{state.max_visits_per_node}"
     )
 
     llm_tool = await tools.get_llm_tool(state.budget_tracker)
     parser = PydanticOutputParser(pydantic_object=FactsCritiqueReport)
 
-    ontology_ttl = state.current_ontology.graph.serialize(format="turtle")
+    ontology_ttl = state.ontology_snapshot.graph.serialize(format="turtle")
 
     ontology_chapter = ontology_template.format(
         ontology_ttl=ontology_ttl,
     )
 
-    facts_ttl = state.current_chunk.graph.serialize(format="turtle")
+    facts_ttl = state.content_unit.graph.serialize(format="turtle")
 
     facts_chapter = facts_template.format(
         facts_ttl=facts_ttl,
     )
 
-    text_chapter = text_template.format(text=state.current_chunk.text)
+    text_chapter = text_template.format(text=state.content_unit.text)
 
     user_instruction = (
         user_template.format(user_instruction=state.facts_user_instruction)
@@ -103,6 +105,9 @@ async def criticise_facts(state: AgentState, tools: ToolBox) -> AgentState:
             prompt=prompt,
             parser=parser,
             prompt_kwargs=prompt_data,
+        )
+        state.set_external_evidence_request(
+            WorkflowNode.CRITICISE_FACTS, critique.external_evidence_request
         )
         logger.debug(
             f"Parsed critique report - success: {critique.success}, "

@@ -3,11 +3,12 @@ from collections import defaultdict
 from typing import Any
 
 from pydantic import ConfigDict, Field
+from rdflib import URIRef
 
-from ontocast.onto.chunk import Chunk
 from ontocast.onto.constants import CHUNK_NULL_IRI, DEFAULT_DOMAIN, ONTOLOGY_NULL_IRI
+from ontocast.onto.content_unit import ContentUnit
 from ontocast.onto.context import AgentContext, AgentType, ContextManager
-from ontocast.onto.enum import FailureStage, Status, WorkflowNode
+from ontocast.onto.enum import FailureStage, RenderMode, Status, WorkflowNode
 from ontocast.onto.model import BasePydanticModel, Suggestions
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
@@ -85,16 +86,13 @@ class AgentState(BasePydanticModel):
     """State for the ontology-based knowledge graph agent.
 
     This class maintains the state of the agent during document processing,
-    including input text, chunks, ontologies, and workflow status.
+    including input text, content units, ontologies, and workflow status.
 
     Attributes:
         input_text: Input text to process.
         current_domain: IRI used for forming document namespace.
         doc_hid: An almost unique hash/id for the parent document.
         files: Files to process.
-        current_chunk: Current document chunk for processing (property, accessed via index).
-        chunks: List of chunks of the input text.
-        chunks_processed: List of processed chunks.
         current_ontology: Current ontology object.
         ontology_addendum: Additional ontology content.
         failure_stage: Stage where failure occurred.
@@ -103,7 +101,7 @@ class AgentState(BasePydanticModel):
         status: Current workflow status.
         node_visits: Number of visits per node.
         max_visits: Maximum number of visits allowed per node.
-        max_chunks: Maximum number of chunks to process.
+        max_chunks: Maximum number of source content units to split and process.
     """
 
     input_text: str = Field(description="Input text", default="")
@@ -111,25 +109,24 @@ class AgentState(BasePydanticModel):
         description="IRI used for forming document namespace", default=DEFAULT_DOMAIN
     )
     doc_hid: str = Field(
-        description="An almost unique hash / id for the parent document of the chunk",
+        description="An almost unique hash / id for the parent document of the current unit",
         default="default_doc",
     )
     files: dict[str, bytes] = Field(
         default_factory=lambda: dict(), description="Files to process"
     )
-    chunks: list[Chunk] = Field(
-        default_factory=lambda: list(), description="Chunks of the input text"
+    content_units: list[ContentUnit] = Field(
+        default_factory=list,
+        description="Pending content units to process.",
     )
-    current_chunk: Chunk = Field(
-        default_factory=lambda: Chunk(
+    current_content_unit: ContentUnit = Field(
+        default_factory=lambda: ContentUnit(
             text="",
-            hid="default",
-            doc_iri=CHUNK_NULL_IRI,
+            index=0,
+            doc_iri=URIRef(CHUNK_NULL_IRI),
         ),
-        description="Chunks of the input text",
-    )
-    chunks_processed: list[Chunk] = Field(
-        default_factory=lambda: list(), description="Chunks of the input text"
+        alias="current_chunk",
+        description="Current content unit under processing.",
     )
     current_ontology: Ontology = Field(
         default_factory=lambda: Ontology(
@@ -190,6 +187,16 @@ class AgentState(BasePydanticModel):
         description="A list of graph update that improve the current graph of facts (applied)",
     )
 
+    parallel_facts_units: list[ContentUnit] = Field(
+        default_factory=list,
+        description="Successful per-unit facts outputs collected during parallel map phase",
+    )
+
+    ontology_units: list[ContentUnit] = Field(
+        default_factory=list,
+        description="Successful per-unit ontology outputs collected during parallel map phase",
+    )
+
     ontology_addendum: Ontology = Field(
         default_factory=lambda: Ontology(
             ontology_id=None,
@@ -223,13 +230,10 @@ class AgentState(BasePydanticModel):
         default=3, description="Maximum number of visits allowed per node"
     )
     max_chunks: int | None = None
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    skip_ontology_development: bool = Field(
-        default=False, description="Skip ontology create/improve steps if True"
-    )
-    skip_facts_rendering: bool = Field(
-        default=False,
-        description="Skip facts rendering and go straight to aggregation if True",
+    model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
+    render_mode: RenderMode = Field(
+        default=RenderMode.ONTOLOGY_AND_FACTS,
+        description=("Rendering mode: ontology, facts, or ontology_and_facts."),
     )
     ontology_max_triples: int | None = Field(
         default=50000,
@@ -265,45 +269,57 @@ class AgentState(BasePydanticModel):
         """Get the status of a workflow node, returning NOT_VISITED if not set."""
         return self.statuses.get(node, Status.NOT_VISITED)
 
+    @property
+    def render_ontology(self) -> bool:
+        """Whether ontology rendering should run."""
+        return self.render_mode in (
+            RenderMode.ONTOLOGY,
+            RenderMode.ONTOLOGY_AND_FACTS,
+        )
+
+    @property
+    def render_facts(self) -> bool:
+        """Whether facts rendering should run."""
+        return self.render_mode in (
+            RenderMode.FACTS,
+            RenderMode.ONTOLOGY_AND_FACTS,
+        )
+
     def set_node_status(self, node: WorkflowNode, status: Status) -> None:
         """Set the status of a workflow node."""
         self.statuses[node] = status
 
+    def get_content_unit_progress_info(self) -> tuple[int, int]:
+        """Get current content unit number and total content units."""
+        from ontocast.onto.constants import CHUNK_NULL_IRI
+
+        has_current_content_unit = CHUNK_NULL_IRI not in self.current_content_unit.iri
+        current_content_unit_number = 1 if has_current_content_unit else 0
+        total_content_units = len(self.content_units)
+        return current_content_unit_number, total_content_units
+
+    def get_content_unit_progress_string(self) -> str:
+        """Get a formatted string showing content unit progress."""
+        current, total = self.get_content_unit_progress_info()
+        if total == 0:
+            return "no content units"
+        return f"content unit {current}/{total}"
+
     def get_chunk_progress_info(self) -> tuple[int, int]:
-        """Get current chunk number and total chunks.
+        """Backward-compatible wrapper for content unit progress.
 
         Returns:
             tuple[int, int]: (current_chunk_number, total_chunks)
         """
-        from ontocast.onto.constants import CHUNK_NULL_IRI
-
-        # Check if there's a chunk currently being processed
-        has_current_chunk = CHUNK_NULL_IRI not in self.current_chunk.iri
-
-        # Current chunk number = chunks done + (1 if currently processing, else 0)
-        current_chunk_number = len(self.chunks_processed) + (
-            1 if has_current_chunk else 0
-        )
-
-        # Total chunks = remaining + done + (1 if currently processing, else 0)
-        total_chunks = (
-            len(self.chunks)
-            + len(self.chunks_processed)
-            + (1 if has_current_chunk else 0)
-        )
-
-        return current_chunk_number, total_chunks
+        return self.get_content_unit_progress_info()
 
     def get_chunk_progress_string(self) -> str:
-        """Get a formatted string showing chunk progress.
+        """Backward-compatible wrapper for content unit progress.
 
         Returns:
             str: Formatted string like "chunk 3/10"
         """
-        current, total = self.get_chunk_progress_info()
-        if total == 0:
-            return "no chunks"
-        return f"chunk {current}/{total}"
+        return self.get_content_unit_progress_string()
 
     @classmethod
     def render_updated_graph(
@@ -394,49 +410,18 @@ class AgentState(BasePydanticModel):
         if not self.ontology_updates:
             return self.current_ontology
 
-        # Create a copy of the current ontology
-        from copy import deepcopy
-
-        updated_ontology = deepcopy(self.current_ontology)
-
         # Use the generalized function to update the graph
         updated_graph, was_applied = self.render_updated_graph(
             self.current_ontology.graph,
             self.ontology_updates,
             max_triples=self.ontology_max_triples,
         )
-        updated_ontology.graph = updated_graph
 
         # If graph wasn't updated (limit exceeded), return original ontology
         if not was_applied:
             return self.current_ontology
 
-        # Set current hash as parent and generate new hash
-        if self.current_ontology.hash:
-            # Set current hash as parent
-            updated_ontology.parent_hashes = [self.current_ontology.hash]
-        else:
-            # If no current hash, this is a root ontology with no parents
-            updated_ontology.parent_hashes = []
-
-        # Set created_at for new version if not already set
-        if not updated_ontology.created_at:
-            from datetime import datetime, timezone
-
-            updated_ontology.created_at = datetime.now(timezone.utc)
-
-        # Compute new hash for the updated ontology
-        # Clear existing hash first so it gets recomputed
-        updated_ontology.hash = None
-        updated_ontology._compute_and_set_hash()
-
-        # If hash computation failed and we have a parent, use parent hash as fallback
-        if not updated_ontology.hash and updated_ontology.parent_hashes:
-            updated_ontology.hash = updated_ontology.parent_hashes[0]
-
-        # Sync properties to update object fields after graph changes
-        updated_ontology.sync_properties_to_graph()
-        return updated_ontology
+        return self.current_ontology.derive_updated_version(updated_graph)
 
     def update_ontology(self) -> None:
         """Update the current ontology with all GraphUpdate objects and clear the updates list.
@@ -462,10 +447,10 @@ class AgentState(BasePydanticModel):
         self.ontology_updates = []
 
     def render_uptodate_facts(self) -> RDFGraph:
-        """Create a copy of the current chunk's graph with all facts GraphUpdate objects applied.
+        """Create a copy of the current content unit graph with facts updates applied.
 
         This method:
-        1. Creates a copy of the current chunk's graph
+        1. Creates a copy of the current content unit's graph
         2. Generates SPARQL queries from all facts GraphUpdate objects
         3. Executes the queries on the copied graph
         4. Returns the updated graph copy
@@ -474,20 +459,20 @@ class AgentState(BasePydanticModel):
             RDFGraph: A copy of the current chunk's graph with all facts updates applied
         """
         if not self.facts_updates:
-            return self.current_chunk.graph
+            return self.current_content_unit.graph
 
         # Use the generalized function to update the graph
         updated_graph, _ = self.render_updated_graph(
-            self.current_chunk.graph, self.facts_updates, max_triples=None
+            self.current_content_unit.graph, self.facts_updates, max_triples=None
         )
         return updated_graph
 
     def update_facts(self) -> None:
-        """Update the current chunk's graph with all facts GraphUpdate objects and clear the updates list.
+        """Update current content unit graph with facts updates and clear the updates list.
 
         This method:
         1. Uses render_uptodate_facts() to get an updated copy
-        2. Replaces the current chunk's graph with the updated copy
+        2. Replaces the current content unit graph with the updated copy
         3. Clears the facts_updates list
         """
         if not self.facts_updates:
@@ -497,7 +482,7 @@ class AgentState(BasePydanticModel):
         updated_graph = self.render_uptodate_facts()
 
         # Replace the current chunk's graph with the updated copy
-        self.current_chunk.graph = updated_graph
+        self.current_content_unit.graph = updated_graph
 
         # Clear the updates list
         self.facts_updates_applied += self.facts_updates
@@ -559,13 +544,13 @@ class AgentState(BasePydanticModel):
         self.status = Status.SUCCESS
 
     @property
-    def doc_iri(self):
+    def doc_iri(self) -> URIRef:
         """Get the document IRI.
 
         Returns:
             str: The document IRI.
         """
-        return f"{self.current_domain}/doc/{self.doc_hid}"
+        return URIRef(f"{self.current_domain}/doc/{self.doc_hid}")
 
     @property
     def doc_namespace(self):

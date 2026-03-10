@@ -8,10 +8,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ontocast.onto.constants import DEFAULT_DATASET, DEFAULT_ONTOLOGIES_DATASET
+from ontocast.onto.enum import RenderMode
 
 
 class LLMProvider(StrEnum):
@@ -49,6 +50,12 @@ class OllamaModel(LLMModelNameAbstract):
 
 
 LLMModelName = OpenAIModel | OllamaModel
+
+
+class WebSearchProvider(StrEnum):
+    """Supported web-search providers."""
+
+    DUCKDUCKGO = "duckduckgo"
 
 
 class LLMConfig(BaseSettings):
@@ -121,20 +128,37 @@ class ServerConfig(BaseSettings):
         default=1000, description="Recursion limit for workflow"
     )
     estimated_chunks: int = Field(default=30, description="Estimated number of chunks")
-    max_visits: int = Field(
-        default=3, description="Maximum number of visits allowed per node"
+    max_visits_per_node: int = Field(
+        default=1,
+        ge=1,
+        description="Maximum number of visits allowed per node",
+        validation_alias=AliasChoices("max_visits_per_node", "max_visits"),
     )
-    skip_ontology_development: bool = Field(
-        default=False, description="Skip ontology critique step"
-    )
-    skip_facts_rendering: bool = Field(
-        default=False, description="Skip facts rendering and go straight to aggregation"
+    render_mode: RenderMode = Field(
+        default=RenderMode.ONTOLOGY_AND_FACTS,
+        description="Rendering mode: ontology, facts, or ontology_and_facts.",
     )
     ontology_max_triples: int | None = Field(
         default=50000,
         description="Maximum number of triples allowed in ontology graph. "
         "Updates that would exceed this limit are skipped with a warning. "
         "Set to None for unlimited.",
+    )
+    parallel_workers: int = Field(
+        default=4,
+        description="Maximum number of concurrent unit workers in parallel pipeline",
+    )
+    parallel_facts_retries: int = Field(
+        default=3,
+        description="Retry budget for unit facts loop",
+    )
+    parallel_ontology_retries: int = Field(
+        default=3,
+        description="Retry budget for unit ontology loop",
+    )
+    enable_ontology_consolidation: bool = Field(
+        default=False,
+        description="Run optional ontology consolidation pass after normalization",
     )
 
     model_config = SettingsConfigDict(
@@ -205,6 +229,134 @@ class PathConfig(BaseSettings):
     )
 
 
+class WebSearchConfig(BaseSettings):
+    """Optional web-search settings for ontology grounding."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable optional web grounding. Node execution still starts without "
+            "search and only searches when node output requests it."
+        ),
+    )
+    provider: WebSearchProvider = Field(
+        default=WebSearchProvider.DUCKDUCKGO, description="Web-search provider"
+    )
+    top_k: int = Field(default=3, ge=1, le=10, description="Number of results to fetch")
+    timeout_seconds: float = Field(
+        default=8.0, ge=1.0, le=60.0, description="Search request timeout"
+    )
+    max_snippet_chars: int = Field(
+        default=400, ge=80, le=2000, description="Snippet truncation limit per hit"
+    )
+    max_total_chars: int = Field(
+        default=1800, ge=200, le=10000, description="Total evidence text budget"
+    )
+    ontology_render_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow search-eligible retries for ontology render prompts "
+            "(first pass remains no-search)."
+        ),
+    )
+    ontology_critic_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow search-eligible retries for ontology critic prompts "
+            "(first pass remains no-search)."
+        ),
+    )
+    facts_render_enabled: bool = Field(
+        default=False,
+        description=(
+            "Allow search-eligible retries for facts render prompts "
+            "(first pass remains no-search)."
+        ),
+    )
+    facts_critic_enabled: bool = Field(
+        default=False,
+        description=(
+            "Allow search-eligible retries for facts critic prompts "
+            "(first pass remains no-search)."
+        ),
+    )
+    planner_enabled: bool = Field(
+        default=True, description="Enable LLM planner for web-search decisions"
+    )
+    planner_max_queries: int = Field(
+        default=3, ge=1, le=8, description="Maximum focused search queries per node"
+    )
+    planner_min_query_chars: int = Field(
+        default=12,
+        ge=3,
+        le=100,
+        description="Minimum query length accepted by guardrails",
+    )
+    planner_min_confidence: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum planner confidence to run search",
+    )
+    reuse_evidence_across_attempt: bool = Field(
+        default=True,
+        description=("Reuse node-scoped evidence between retries for the same unit."),
+    )
+    min_snippet_chars: int = Field(
+        default=40,
+        ge=0,
+        le=1000,
+        description="Minimum snippet length to keep a search hit",
+    )
+    allowed_domains: list[str] = Field(
+        default_factory=list,
+        description="Optional allowlist of source domains for evidence",
+    )
+    blocked_domains: list[str] = Field(
+        default_factory=list,
+        description="Optional blocklist of source domains for evidence",
+    )
+    region: str = Field(default="wt-wt", description="DuckDuckGo region code")
+    safesearch: str = Field(
+        default="moderate", description="DuckDuckGo safesearch mode"
+    )
+
+    @field_validator("allowed_domains", "blocked_domains", mode="before")
+    @classmethod
+    def parse_domains(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, list):
+            return [entry.strip().lower() for entry in value if entry.strip()]
+        if isinstance(value, str):
+            raw_values = [entry.strip().lower() for entry in value.split(",")]
+            return [entry for entry in raw_values if entry]
+        return []
+
+    model_config = SettingsConfigDict(
+        env_prefix="WEB_SEARCH_",
+        case_sensitive=False,
+    )
+
+
+class AggregationConfig(BaseSettings):
+    """Aggregation settings for entity clustering/disambiguation."""
+
+    embedding_model: str = Field(
+        default="paraphrase-multilingual-MiniLM-L12-v2",
+        description="Sentence-transformers model name used for entity embeddings.",
+    )
+    similarity_threshold: float = Field(
+        default=0.80,
+        ge=0.0,
+        le=1.0,
+        description="Cosine similarity threshold used by DBSCAN clustering.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="AGG_",
+        case_sensitive=False,
+    )
+
+
 class ToolConfig(BaseSettings):
     """Configuration for tools (LLM, triple stores, paths, chunking)."""
 
@@ -214,6 +366,8 @@ class ToolConfig(BaseSettings):
     neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
     fuseki: FusekiConfig = Field(default_factory=FusekiConfig)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    aggregation: AggregationConfig = Field(default_factory=AggregationConfig)
 
 
 class Config(BaseSettings):

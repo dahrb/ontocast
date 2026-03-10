@@ -14,6 +14,31 @@ from ontocast.onto.sparql_models import (
 )
 
 
+def test_rdfgraph_recovers_dangling_semicolon_at_eof() -> None:
+    """RDFGraph should recover from common LLM-truncated Turtle at EOF."""
+    ttl = """
+    @prefix ex: <http://example.org/> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+    ex:Case85_968 a ex:Appeal ;
+        ex:appealsTo ex:Cassation ;
+    """
+
+    graph = RDFGraph._from_turtle_str(ttl)
+
+    assert len(graph) == 2
+    assert (
+        URIRef("http://example.org/Case85_968"),
+        URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        URIRef("http://example.org/Appeal"),
+    ) in graph
+    assert (
+        URIRef("http://example.org/Case85_968"),
+        URIRef("http://example.org/appealsTo"),
+        URIRef("http://example.org/Cassation"),
+    ) in graph
+
+
 def test_graph_update_with_language_tags():
     """Test GraphUpdate with language-tagged literals."""
     # Create initial RDFGraph
@@ -118,6 +143,38 @@ def test_graph_update_insert_operation():
         URIRef("http://www.w3.org/2000/01/rdf-schema#label"),
         Literal("John Doe"),
     ) in graph
+
+
+def test_graph_update_extract_insert_graph() -> None:
+    """Test GraphUpdate.extract_insert_graph returns only insert triples."""
+    insert_ttl = """
+    @prefix ex: <http://example.org/> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    ex:Person a rdfs:Class .
+    ex:Person rdfs:label "Person" .
+    """
+    delete_ttl = """
+    @prefix ex: <http://example.org/> .
+    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    ex:Obsolete a rdfs:Class .
+    """
+    gu = GraphUpdate(
+        triple_operations=[
+            TripleOp(type="insert", graph=insert_ttl),  # type: ignore[arg-type]
+            TripleOp(type="delete", graph=delete_ttl),  # type: ignore[arg-type]
+        ]
+    )
+    insert_graph = gu.extract_insert_graph()
+    assert len(insert_graph) == 2
+    person_uri = URIRef("http://example.org/Person")
+    rdf_type = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+    rdfs_class = URIRef("http://www.w3.org/2000/01/rdf-schema#Class")
+    rdfs_label = URIRef("http://www.w3.org/2000/01/rdf-schema#label")
+    assert (person_uri, rdf_type, rdfs_class) in insert_graph
+    assert (person_uri, rdfs_label, Literal("Person")) in insert_graph
+    obsolete_uri = URIRef("http://example.org/Obsolete")
+    assert (obsolete_uri, rdf_type, rdfs_class) not in insert_graph
 
 
 def test_graph_update_delete_operation():

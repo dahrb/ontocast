@@ -1,9 +1,8 @@
-import hashlib
 import json
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextvars import ContextVar
 from typing import Any, Union
 
@@ -14,6 +13,7 @@ from rdflib import Graph, Literal, Namespace, URIRef
 from rdflib.namespace import NamespaceManager
 
 from ontocast.onto.constants import COMMON_PREFIXES
+from ontocast.util import render_text_hash
 
 logger = logging.getLogger(__name__)
 
@@ -260,8 +260,36 @@ class RDFGraph(Graph):
         turtle_str = bytes(turtle_str, "utf-8").decode("unicode_escape")
         patched_turtle = cls._ensure_prefixes(turtle_str)
         g = cls()
-        g.parse(data=patched_turtle, format="turtle")
-        return g
+        try:
+            g.parse(data=patched_turtle, format="turtle")
+            return g
+        except Exception as parse_error:
+            # Typical LLM truncation: dangling ';' or ',' at EOF in property list.
+            if "EOF found when expected verb in property list" not in str(parse_error):
+                raise
+            repaired_turtle = cls._repair_truncated_turtle(patched_turtle)
+            if repaired_turtle == patched_turtle:
+                raise
+            logger.warning(
+                "Recovering truncated Turtle by closing dangling property list punctuation."
+            )
+            repaired_graph = cls()
+            repaired_graph.parse(data=repaired_turtle, format="turtle")
+            return repaired_graph
+
+    @staticmethod
+    def _repair_truncated_turtle(turtle_str: str) -> str:
+        """Repair common LLM Turtle truncation patterns.
+
+        This only applies a minimal fix when content ends with dangling property-list
+        punctuation (';' or ',') and no terminating '.'.
+        """
+        stripped = turtle_str.rstrip()
+        if not stripped:
+            return turtle_str
+        if stripped.endswith(";") or stripped.endswith(","):
+            return f"{stripped[:-1].rstrip()} .\n"
+        return turtle_str
 
     @classmethod
     def set_known_prefixes(cls, prefixes: dict[str, str] | None) -> None:
@@ -343,18 +371,167 @@ class RDFGraph(Graph):
     def _to_turtle_str(g: Any) -> str:
         """Convert an RDFGraph to a Turtle string.
 
+        For graphs backed by the *oxigraph* store the serialisation is
+        delegated to ``pyoxigraph`` so that RDF 1.2 triple-term syntax
+        (``<<( s p o )>>``) is emitted correctly.
+
         Args:
             g: The RDFGraph instance.
 
         Returns:
-            str: The Turtle string representation.
+            str: The Turtle (or Turtle-star) string representation.
         """
+        if hasattr(g, "store") and type(g.store).__name__ == "OxigraphStore":
+            return g.serialize_turtle_star()
         return g.serialize(format="turtle")
+
+    def serialize_turtle_star(self) -> str:
+        """Serialize an oxigraph-backed graph to Turtle-star via *pyoxigraph*.
+
+        This method extracts all quads belonging to this graph's context
+        from the underlying ``pyoxigraph.Store`` and serialises them into
+        the default graph using ``pyoxigraph.serialize`` with the Turtle
+        format, which natively supports RDF 1.2 ``<<( … )>>`` syntax.
+
+        Returns:
+            Turtle-star string.
+
+        Raises:
+            RuntimeError: If the graph is not backed by an oxigraph store.
+        """
+        try:
+            import pyoxigraph as ox
+            from oxrdflib._converter import to_ox
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyoxigraph / oxrdflib must be installed for Turtle-star serialisation"
+            ) from exc
+
+        inner_store: ox.Store = self.store._inner  # type: ignore[attr-defined]
+        graph_ctx_raw = to_ox(self.identifier)
+        assert isinstance(
+            graph_ctx_raw,
+            (ox.NamedNode, ox.BlankNode, ox.DefaultGraph),
+        )
+        graph_ctx: ox.NamedNode | ox.BlankNode | ox.DefaultGraph = graph_ctx_raw
+
+        # Copy quads into a temporary store under the default graph so
+        # that ``ox.serialize`` can emit plain Turtle (Turtle-star).
+        tmp = ox.Store()
+        used_iri_terms: set[str] = set()
+
+        def _collect_used_iris(term: Any) -> None:
+            if isinstance(term, ox.NamedNode):
+                used_iri_terms.add(term.value)
+                return
+            if isinstance(term, ox.Triple):
+                _collect_used_iris(term.subject)
+                _collect_used_iris(term.predicate)
+                _collect_used_iris(term.object)
+
+        for quad in inner_store.quads_for_pattern(
+            None,
+            None,
+            None,
+            graph_ctx,
+        ):
+            _collect_used_iris(quad.subject)
+            _collect_used_iris(quad.predicate)
+            _collect_used_iris(quad.object)
+            tmp.add(
+                ox.Quad(quad.subject, quad.predicate, quad.object, ox.DefaultGraph())
+            )
+
+        namespace_to_prefix: dict[str, str] = {}
+        for prefix, namespace in self.namespaces():
+            if not prefix:
+                continue
+            prefix_str = str(prefix)
+            namespace_str = str(namespace)
+            current = namespace_to_prefix.get(namespace_str)
+            if current is None or (len(prefix_str), prefix_str) < (
+                len(current),
+                current,
+            ):
+                namespace_to_prefix[namespace_str] = prefix_str
+
+        prefixes = {
+            prefix: namespace
+            for namespace, prefix in namespace_to_prefix.items()
+            if any(iri.startswith(namespace) for iri in used_iri_terms)
+        }
+        raw: bytes = tmp.dump(
+            format=ox.RdfFormat.TURTLE,
+            from_graph=ox.DefaultGraph(),
+            prefixes=prefixes or None,
+        )  # type: ignore[assignment]
+        return raw.decode()
 
     def __new__(cls, *args, **kwargs):
         """Create a new RDFGraph instance."""
         instance = super().__new__(cls)
         return instance
+
+    def serialize(
+        self,
+        destination: Any = None,
+        format: str = "turtle",
+        base: str | None = None,
+        encoding: str | None = None,
+        **args: Any,
+    ) -> Any:
+        """Serialize the graph, delegating to pyoxigraph for oxigraph stores.
+
+        When the graph is backed by an *oxigraph* store and the requested
+        format is ``"turtle"`` (or ``"ttl"``), serialisation is handled by
+        ``pyoxigraph`` which natively supports RDF 1.2 triple terms.
+        For all other stores or formats the default rdflib serialiser is
+        used.
+        """
+        is_ox = type(self.store).__name__ == "OxigraphStore"
+        if is_ox and format in ("turtle", "ttl"):
+            ttl = self.serialize_turtle_star()
+            if destination is not None:
+                enc = encoding or "utf-8"
+                with open(destination, "w", encoding=enc) as fh:
+                    fh.write(ttl)
+                return None
+            return ttl
+        return super().serialize(
+            destination=destination,
+            format=format,
+            base=base,
+            encoding=encoding,
+            **args,
+        )
+
+    def update(
+        self,
+        update_object: Any,
+        processor: Any = "sparql",
+        initNs: Mapping[str, Any] | None = None,
+        initBindings: Mapping[str, Any] | None = None,
+        use_store_provided: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Execute SPARQL update using a base Graph view.
+
+        rdflib's SPARQL update engine has internal checks that branch on exact
+        ``Graph`` type, which can break for subclasses on ``INSERT/DELETE ... WHERE``.
+        Running updates through a base ``Graph`` view avoids that edge case while
+        still operating on the same underlying store/identifier.
+        """
+        graph_view = Graph(store=self.store, identifier=self.identifier)
+        graph_view.namespace_manager = self.namespace_manager
+        graph_view.update(
+            update_object=update_object,
+            processor=processor,
+            initNs=initNs,
+            initBindings=initBindings,
+            use_store_provided=use_store_provided,
+            **kwargs,
+        )
+        return None
 
     def sanitize_prefixes_namespaces(self):
         """
@@ -577,4 +754,4 @@ class RDFGraph(Graph):
         )
         # jsonld.normalize returns a string when format is "application/n-quads"
         normalized_str = normalized if isinstance(normalized, str) else str(normalized)
-        return hashlib.sha256(normalized_str.encode("utf-8")).hexdigest()
+        return render_text_hash(normalized_str, digits=None)

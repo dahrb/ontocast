@@ -7,11 +7,10 @@ documents.
 
 import logging
 
-from ontocast.onto.chunk import Chunk
+from ontocast.onto.content_unit import ContentUnit
 from ontocast.onto.enum import Status
 from ontocast.onto.state import AgentState
 from ontocast.toolbox import ToolBox
-from ontocast.util import render_text_hash
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +40,19 @@ def chunk_text(state: AgentState, tools: ToolBox) -> AgentState:
 
             chunks_txt = chunks_txt[: state.max_chunks]
 
-        for chunk_txt in chunks_txt:
-            state.chunks.append(
-                Chunk(
+        for i, chunk_txt in enumerate(chunks_txt):
+            state.content_units.append(
+                ContentUnit(
                     text=chunk_txt,
-                    hid=render_text_hash(chunk_txt),
+                    index=i,
                     doc_iri=state.doc_iri,
                 )
             )
 
         logger.info(
-            f"Created {len(state.chunks)} chunks for processing: {[len(c) for c in state.chunks]}"
+            "Created "
+            f"{len(state.content_units)} content units for processing: "
+            f"{[len(c) for c in state.content_units]}"
         )
         state.status = Status.SUCCESS
     else:
