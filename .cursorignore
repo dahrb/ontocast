@@ -20,6 +20,12 @@
 !data/**
 
 
+!docker
+!docker/**
+
+!planning
+!planning/**
+
 !.github/**
 !.github/**/*yml
 !.env.example
@@ -29,3 +35,9 @@
 !Dockerfile
 
 !planning
+
+!.cursor/rules/*.mdc
+
+!scripts
+!scripts/*py
+

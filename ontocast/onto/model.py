@@ -1,8 +1,9 @@
 import pathlib
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ontocast.onto.llm_graph_payload import LLMGraphWire
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.onto.sparql_models import GraphUpdate
@@ -101,21 +102,25 @@ class OntologySelectorReport(BasePydanticModel):
 class SemanticTriplesFactsReport(BaseModel):
     """Report containing semantic triples and evaluation scores.
 
+    Graph payloads follow ``LLM_GRAPH_FORMAT``; both wire encodings parse to ``RDFGraph``.
+
     Attributes:
-        semantic_graph: Semantic triples (facts) representing the document
-            in turtle (ttl) format.
+        semantic_graph: Semantic triples (facts) representing the document.
         ontology_relevance_score: Score 0-100 for how relevant the ontology
             is to the document. 0 is the worst, 100 is the best.
         triples_generation_score: Score 0-100 for how well the facts extraction /
             triples generation was performed. 0 is the worst, 100 is the best.
     """
 
-    semantic_graph: RDFGraph = Field(
+    semantic_graph: LLMGraphWire = Field(
         default_factory=RDFGraph,
-        description="Semantic triples (facts) representing the document "
-        "in turtle format: use prefixes for namespaces, do NOT add comments",
+        description=(
+            "Semantic triples (facts) representing the document. "
+            "Encoding is defined by deployment llm_graph_format and OUTPUT INSTRUCTION."
+        ),
     )
     ontology_relevance_score: float | None = Field(
+        default=None,
         ge=0,
         le=100,
         description=(
@@ -124,6 +129,7 @@ class SemanticTriplesFactsReport(BaseModel):
         ),
     )
     triples_generation_score: float | None = Field(
+        default=None,
         ge=0,
         le=100,
         description=(
@@ -179,13 +185,48 @@ class ExternalEvidenceRequest(BaseModel):
 class FactsRenderReport(BaseModel):
     """Facts rendering output with optional search decision."""
 
-    facts_report: SemanticTriplesFactsReport = Field(
-        description="Rendered facts payload."
+    semantic_graph: LLMGraphWire = Field(
+        default_factory=RDFGraph,
+        description=(
+            "Semantic triples (facts) representing the document. "
+            "Encoding is defined by deployment llm_graph_format and OUTPUT INSTRUCTION."
+        ),
+    )
+    ontology_relevance_score: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=(
+            "Score between 0 and 100 of how well "
+            "the ontology represents the domain of the document."
+        ),
+    )
+    triples_generation_score: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=(
+            "Score 0-100 for how well the semantic triples "
+            "represent the document. 0 is the worst, 100 is the best."
+        ),
     )
     external_evidence_request: ExternalEvidenceRequest = Field(
         default_factory=ExternalEvidenceRequest,
         description="Optional request to run web search before retrying.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_legacy_facts_report(cls, data: object) -> object:
+        if not isinstance(data, dict) or "facts_report" not in data:
+            return data
+        payload = dict(data)
+        nested = payload.pop("facts_report")
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                if key not in payload:
+                    payload[key] = value
+        return payload
 
 
 class GraphUpdateRenderReport(BaseModel):
@@ -199,6 +240,12 @@ class GraphUpdateRenderReport(BaseModel):
 
 
 class TripleFix(BaseModel):
+    """A single actionable correction to an RDF facts or ontology graph.
+
+    ``incorrect_value`` / ``correct_value`` are plain strings; encoding follows
+    deployment ``llm_graph_format`` and GRAPH FORMAT INSTRUCTION.
+    """
+
     text_fragment: str = Field(
         description="Exact quote from source text justifying this change"
     )
@@ -253,12 +300,18 @@ class TripleFix(BaseModel):
 
     incorrect_value: str | None = Field(
         default=None,
-        description="Current incorrect triple/entity/value (for REMOVE and REPLACE). Use Turtle syntax.",
+        description=(
+            "Current incorrect triple/entity/value (for REMOVE and REPLACE). "
+            "Encoding is defined by deployment llm_graph_format and GRAPH FORMAT INSTRUCTION."
+        ),
     )
 
     correct_value: str | None = Field(
         default=None,
-        description="Proposed correct triple/entity/value (for ADD and REPLACE). Use Turtle syntax.",
+        description=(
+            "Proposed correct triple/entity/value (for ADD and REPLACE). "
+            "Encoding is defined by deployment llm_graph_format and GRAPH FORMAT INSTRUCTION."
+        ),
     )
 
     explanation: str = Field(
@@ -303,6 +356,14 @@ class TripleFix(BaseModel):
         return "\n".join(lines)
 
 
+def _coerce_critique_score(v: object) -> float:
+    """Coerce LLM score output (may be a JSON string) to float."""
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class OntologyCritiqueReport(BaseModel):
     """Report from ontology update critique process."""
 
@@ -315,10 +376,18 @@ class OntologyCritiqueReport(BaseModel):
         description="Score 0-100 for how well the presented ontology serves as the ontology for the document. 0 is the worst, 100 is the best.",
     )
 
+    @field_validator("score", mode="before")
+    @classmethod
+    def coerce_score(cls, v: object) -> float:
+        return _coerce_critique_score(v)
+
     actionable_ontology_fixes: list[TripleFix] = Field(
         default_factory=list,
-        description="List of specific fixes to correct the facts graph. "
-        "For each fix, provide the text evidence, the action type, and the relevant triples.",
+        description=(
+            "List of specific fixes to correct the ontology graph. "
+            "For each fix, provide text evidence, action type, and relevant triples "
+            "in deployment graph syntax (Turtle or JSON-LD per output instructions)."
+        ),
     )
 
     systemic_critique_summary: str = Field(
@@ -345,11 +414,17 @@ class FactsCritiqueReport(BaseModel):
         ),
     )
 
+    @field_validator("score", mode="before")
+    @classmethod
+    def coerce_score(cls, v: object) -> float:
+        return _coerce_critique_score(v)
+
     actionable_triple_fixes: list[TripleFix] = Field(
         default_factory=list,
         description=(
             "List of specific fixes to correct the facts graph. "
-            "For each fix, provide the text evidence, the action type, and the relevant triples."
+            "For each fix, provide text evidence, action type, and relevant triples "
+            "in deployment graph syntax (Turtle or JSON-LD per output instructions)."
         ),
     )
 
@@ -475,13 +550,12 @@ class Suggestions(BaseModel):
         Returns:
             Suggestions object with actionable fixes and systemic critique summary.
         """
-        # Extract actionable fixes based on the type of critique report
-        if isinstance(critique, OntologyCritiqueReport):
-            actionable_fixes = critique.actionable_ontology_fixes
-        elif isinstance(critique, FactsCritiqueReport):
-            actionable_fixes = critique.actionable_triple_fixes
-        else:
+        fixes = getattr(critique, "actionable_triple_fixes", None)
+        if fixes is None:
+            fixes = getattr(critique, "actionable_ontology_fixes", None)
+        if fixes is None:
             raise ValueError(f"Unsupported critique report type: {type(critique)}")
+        actionable_fixes = fixes
 
         return cls(
             actionable_fixes=actionable_fixes,

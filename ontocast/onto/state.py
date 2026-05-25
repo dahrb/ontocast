@@ -1,19 +1,34 @@
+from __future__ import annotations
+
 import os
+import re
 from collections import defaultdict
 from typing import Any
 
 from pydantic import ConfigDict, Field
 from rdflib import URIRef
 
-from ontocast.onto.constants import CHUNK_NULL_IRI, DEFAULT_DOMAIN, ONTOLOGY_NULL_IRI
+from ontocast.onto.constants import DEFAULT_DOMAIN, ONTOLOGY_NULL_IRI
 from ontocast.onto.content_unit import ContentUnit
 from ontocast.onto.context import AgentContext, AgentType, ContextManager
-from ontocast.onto.enum import FailureStage, RenderMode, Status, WorkflowNode
+from ontocast.onto.enum import (
+    FailureStage,
+    LLMGraphFormat,
+    OntologyAssemblyMode,
+    OntologyContextMode,
+    RenderMode,
+    Status,
+    WorkflowNode,
+)
+from ontocast.onto.iri_policy import normalize_namespace_iri
 from ontocast.onto.model import BasePydanticModel, Suggestions
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.onto.sparql_models import GraphUpdate, TripleOp
-from ontocast.util import iri2namespace, render_text_hash
+from ontocast.util import render_text_hash
+
+# Top-level SPARQL update keywords at line start (used to split compound LLM output).
+_TOP_LEVEL_UPDATE_START_RE = re.compile(r"(?m)^(?=(?:INSERT|DELETE|WITH)\b)")
 
 
 class BudgetTracker(BasePydanticModel):
@@ -65,6 +80,16 @@ class BudgetTracker(BasePydanticModel):
         self.facts_operations_count += num_operations
         self.facts_triples_generated += num_triples
 
+    def merge_from(self, other: BudgetTracker) -> None:
+        """Accumulate counters from another tracker (e.g. parallel unit workers)."""
+        self.chars_sent += other.chars_sent
+        self.chars_received += other.chars_received
+        self.calls_count += other.calls_count
+        self.ontology_triples_generated += other.ontology_triples_generated
+        self.facts_triples_generated += other.facts_triples_generated
+        self.ontology_operations_count += other.ontology_operations_count
+        self.facts_operations_count += other.facts_operations_count
+
     def get_summary(self) -> str:
         """Get a summary of LLM usage and generated triples."""
         parts = [
@@ -92,8 +117,7 @@ class AgentState(BasePydanticModel):
         input_text: Input text to process.
         current_domain: IRI used for forming document namespace.
         doc_hid: An almost unique hash/id for the parent document.
-        files: Files to process.
-        current_ontology: Current ontology object.
+        raw_input: Single raw input payload as {filename: bytes}.
         ontology_addendum: Additional ontology content.
         failure_stage: Stage where failure occurred.
         failure_reason: Reason for failure.
@@ -112,33 +136,57 @@ class AgentState(BasePydanticModel):
         description="An almost unique hash / id for the parent document of the current unit",
         default="default_doc",
     )
-    files: dict[str, bytes] = Field(
-        default_factory=lambda: dict(), description="Files to process"
+    raw_input: dict[str, bytes] = Field(
+        default_factory=dict,
+        description="Single raw input payload: {filename: bytes}.",
     )
     content_units: list[ContentUnit] = Field(
         default_factory=list,
         description="Pending content units to process.",
     )
-    current_content_unit: ContentUnit = Field(
-        default_factory=lambda: ContentUnit(
-            text="",
-            index=0,
-            doc_iri=URIRef(CHUNK_NULL_IRI),
-        ),
-        alias="current_chunk",
-        description="Current content unit under processing.",
+    ontology_patch_sources: list[str] = Field(
+        default_factory=list,
+        description="Ontology IRIs that contributed to a retrieved multi-source patch context.",
     )
-    current_ontology: Ontology = Field(
-        default_factory=lambda: Ontology(
-            ontology_id=None,
-            title=None,
-            description=None,
-            graph=RDFGraph(),
-            iri=ONTOLOGY_NULL_IRI,
-        ),
-        description="Ontology object that contain the semantic graph "
-        "as well as the description, name, short name, version, "
-        "and IRI of the ontology",
+    ontology_artifacts: list[Ontology] = Field(
+        default_factory=list,
+        description="Final per-anchor ontology artifacts produced for this document.",
+    )
+    reduced_ontology_artifacts: list[Ontology] = Field(
+        default_factory=list,
+        description="Reduced ontology artifacts after explicit ontology reduce step.",
+    )
+    reduced_ontology_by_anchor: dict[str, Ontology] = Field(
+        default_factory=dict,
+        description="Reduced ontology artifacts indexed by anchor IRI.",
+    )
+    ontology_reduce_metrics: dict[str, int | float | str] = Field(
+        default_factory=dict,
+        description="Metrics emitted by ontology reduce stage.",
+    )
+    ontology_reduce_provenance: RDFGraph = Field(
+        default_factory=RDFGraph,
+        description="Optional provenance graph emitted by ontology reduce stage.",
+    )
+    candidate_anchor_iris: list[str] = Field(
+        default_factory=list,
+        description="Candidate ontology IRIs discovered during multi-anchor preselection.",
+    )
+    unit_anchor_assignment: dict[int, str] = Field(
+        default_factory=dict,
+        description="Assigned anchor ontology IRI per content unit index.",
+    )
+    unit_patch_sources: dict[int, list[str]] = Field(
+        default_factory=dict,
+        description="Retrieved ontology source IRIs per content unit index.",
+    )
+    unit_context_mode_used: dict[int, OntologyAssemblyMode] = Field(
+        default_factory=dict,
+        description="Per-unit ontology assembly mode (ensemble / vote majority / primary).",
+    )
+    retrieval_metrics: dict[str, int | float | str] = Field(
+        default_factory=dict,
+        description="Runtime retrieval/evaluation metrics for observability.",
     )
     aggregated_facts: RDFGraph = Field(
         description="RDF triples representing aggregated facts "
@@ -150,14 +198,34 @@ class AgentState(BasePydanticModel):
         default="",
     )
 
+    ontology_selection_user_instruction: str = Field(
+        description=(
+            "Specific user instructions for ontology selection, "
+            "e.g. `Prefer ontologies focused on finance`"
+        ),
+        default="",
+    )
+
     facts_user_instruction: str = Field(
         description="Specific user instructions for facts extraction, e.g. `Focus on extracting places`",
         default="",
     )
 
-    dataset: str | None = Field(
-        description="Fuseki dataset name for this request (optional)",
+    ontology_context_fixed_ontology_id: str = Field(
+        description=(
+            "Catalog ontology id when ontology_context_mode is fixed_single_ontology "
+            "(resolved via OntologyManager)."
+        ),
+        default="",
+    )
+
+    tenant: str | None = Field(
         default=None,
+        description="Tenant id when request selected tenancy via query/CLI.",
+    )
+    project: str | None = Field(
+        default=None,
+        description="Project id when request selected tenancy via query/CLI.",
     )
 
     graph_uri_override: str | None = Field(default=None)
@@ -187,7 +255,7 @@ class AgentState(BasePydanticModel):
         description="A list of graph update that improve the current graph of facts (applied)",
     )
 
-    parallel_facts_units: list[ContentUnit] = Field(
+    facts_units: list[ContentUnit] = Field(
         default_factory=list,
         description="Successful per-unit facts outputs collected during parallel map phase",
     )
@@ -239,6 +307,22 @@ class AgentState(BasePydanticModel):
         default=RenderMode.ONTOLOGY_AND_FACTS,
         description=("Rendering mode: ontology, facts, or ontology_and_facts."),
     )
+    llm_graph_format: LLMGraphFormat = Field(
+        default=LLMGraphFormat.TURTLE,
+        description=(
+            "Format used by the LLM for emitting RDF graph payloads: "
+            "'turtle' (legacy) or 'jsonld' (compact JSON-LD objects embedded "
+            "directly in the structured response)."
+        ),
+    )
+    ontology_context_mode: OntologyContextMode = Field(
+        default=OntologyContextMode.SELECTED_SINGLE_ONTOLOGY,
+        description=(
+            "Per-unit ontology context: selected_single_ontology (LLM-picked catalog), "
+            "selected_vector_search_ontology (Qdrant ensemble), or "
+            "fixed_single_ontology (catalog ontology_id via ontology_context_fixed_ontology_id)."
+        ),
+    )
     ontology_max_triples: int | None = Field(
         default=50000,
         description="Maximum number of triples allowed in ontology graph. "
@@ -251,7 +335,7 @@ class AgentState(BasePydanticModel):
     )
     suggestions: Suggestions = Field(
         default_factory=Suggestions,
-        description="Context manager for passing information between agents",
+        description="Structured critique feedback for the next render/critic pass",
     )
 
     # Budget Tracking
@@ -295,11 +379,8 @@ class AgentState(BasePydanticModel):
 
     def get_content_unit_progress_info(self) -> tuple[int, int]:
         """Get current content unit number and total content units."""
-        from ontocast.onto.constants import CHUNK_NULL_IRI
-
-        has_current_content_unit = CHUNK_NULL_IRI not in self.current_content_unit.iri
-        current_content_unit_number = 1 if has_current_content_unit else 0
         total_content_units = len(self.content_units)
+        current_content_unit_number = 1 if total_content_units > 0 else 0
         return current_content_unit_number, total_content_units
 
     def get_content_unit_progress_string(self) -> str:
@@ -395,165 +476,37 @@ class AgentState(BasePydanticModel):
 
     @classmethod
     def _apply_update_query(cls, graph: RDFGraph, query: str) -> None:
-        """Apply one SPARQL update query, recovering common LLM compound outputs."""
-        try:
-            graph.update(query)
-            return
-        except Exception as exc:
-            split_queries = cls._split_compound_sparql_updates(query, exc)
-            if not split_queries:
-                raise
-            for split_query in split_queries:
-                graph.update(split_query)
+        """Apply one SPARQL update query, splitting compound LLM output proactively."""
+        parts = cls._split_compound_sparql_query(query)
+        for part in parts:
+            graph.update(part)
 
     @staticmethod
-    def _split_compound_sparql_updates(
-        query: str, parse_error: Exception
-    ) -> list[str] | None:
-        """Split concatenated top-level UPDATE statements if parser rejects input.
+    def _split_compound_sparql_query(query: str) -> list[str]:
+        """Split a query string containing concatenated top-level UPDATE statements.
 
-        LLM outputs sometimes concatenate multiple update statements (e.g. two
-        top-level INSERT blocks) into a single custom SPARQL string without a
-        separator accepted by the parser. We only recover in that specific case.
+        LLMs frequently emit several ``INSERT DATA`` / ``DELETE DATA`` blocks joined
+        after a shared ``PREFIX`` block.  Splitting on top-level keyword boundaries
+        before calling ``graph.update`` avoids parse errors entirely.
+
+        A single-statement query is returned as a one-element list.
         """
-        message = str(parse_error)
-        if "Expected end of text, found" not in message:
-            return None
+        stripped = query.strip()
+        if not stripped:
+            return [stripped]
 
-        prefixes: list[str] = []
-        body_lines: list[str] = []
-        for raw_line in query.splitlines():
-            stripped = raw_line.strip()
-            if stripped.upper().startswith("PREFIX "):
-                prefixes.append(stripped)
-            elif stripped:
-                body_lines.append(stripped)
+        starts = [m.start() for m in _TOP_LEVEL_UPDATE_START_RE.finditer(stripped)]
+        if len(starts) <= 1:
+            return [stripped]
 
-        if not body_lines:
-            return None
-
-        top_level_ops = ("INSERT", "DELETE", "WITH")
-        segments: list[list[str]] = []
-        current: list[str] = []
-        for line in body_lines:
-            if current and line.upper().startswith(top_level_ops):
-                segments.append(current)
-                current = [line]
-            else:
-                current.append(line)
-        if current:
-            segments.append(current)
-
-        if len(segments) <= 1:
-            return None
-
-        prefix_block = "\n".join(prefixes)
-        rebuilt = []
-        for segment in segments:
-            segment_block = "\n".join(segment)
-            rebuilt.append(
-                f"{prefix_block}\n{segment_block}" if prefix_block else segment_block
-            )
-        return rebuilt
-
-    def render_uptodate_ontology(self) -> Ontology:
-        """Create a copy of the current ontology with all GraphUpdate objects applied.
-
-        This method:
-        1. Creates a copy of the current ontology
-        2. Generates SPARQL queries from all GraphUpdate objects
-        3. Executes the queries on the copied ontology graph
-        4. Checks if the updated graph exceeds max_triples limit
-        5. Sets the current hash as parent_hash in the updated ontology
-        6. Computes a new hash for the updated ontology
-        7. Syncs properties to ensure object fields are updated
-        8. Returns the updated ontology copy, or original if limit exceeded
-
-        Returns:
-            Ontology: A copy of the current ontology with all updates applied and
-            a new hash generated, with the previous hash set as parent.
-            Returns original ontology if update would exceed max_triples limit.
-        """
-        if not self.ontology_updates:
-            return self.current_ontology
-
-        # Use the generalized function to update the graph
-        updated_graph, was_applied = self.render_updated_graph(
-            self.current_ontology.graph,
-            self.ontology_updates,
-            max_triples=self.ontology_max_triples,
-        )
-
-        # If graph wasn't updated (limit exceeded), return original ontology
-        if not was_applied:
-            return self.current_ontology
-
-        return self.current_ontology.derive_updated_version(updated_graph)
-
-    def update_ontology(self) -> None:
-        """Update the current ontology with all GraphUpdate objects and clear the updates list.
-
-        This method:
-        1. Uses render_uptodate_ontology() to get an updated copy
-        2. Replaces the current ontology with the updated copy
-        3. Clears the ontology_updates list
-
-        Note: Version update is deferred to aggregate_serialize() to update only once at the end.
-        """
-        if not self.ontology_updates:
-            return
-
-        # Get the updated ontology copy
-        updated_ontology = self.render_uptodate_ontology()
-
-        # Replace the current ontology with the updated copy
-        self.current_ontology = updated_ontology
-
-        # Clear the updates list
-        self.ontology_updates_applied += self.ontology_updates
-        self.ontology_updates = []
-
-    def render_uptodate_facts(self) -> RDFGraph:
-        """Create a copy of the current content unit graph with facts updates applied.
-
-        This method:
-        1. Creates a copy of the current content unit's graph
-        2. Generates SPARQL queries from all facts GraphUpdate objects
-        3. Executes the queries on the copied graph
-        4. Returns the updated graph copy
-
-        Returns:
-            RDFGraph: A copy of the current chunk's graph with all facts updates applied
-        """
-        if not self.facts_updates:
-            return self.current_content_unit.graph
-
-        # Use the generalized function to update the graph
-        updated_graph, _ = self.render_updated_graph(
-            self.current_content_unit.graph, self.facts_updates, max_triples=None
-        )
-        return updated_graph
-
-    def update_facts(self) -> None:
-        """Update current content unit graph with facts updates and clear the updates list.
-
-        This method:
-        1. Uses render_uptodate_facts() to get an updated copy
-        2. Replaces the current content unit graph with the updated copy
-        3. Clears the facts_updates list
-        """
-        if not self.facts_updates:
-            return
-
-        # Get the updated graph copy
-        updated_graph = self.render_uptodate_facts()
-
-        # Replace the current chunk's graph with the updated copy
-        self.current_content_unit.graph = updated_graph
-
-        # Clear the updates list
-        self.facts_updates_applied += self.facts_updates
-        self.facts_updates = []
+        prefix_block = stripped[: starts[0]].strip()
+        parts: list[str] = []
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(stripped)
+            body = stripped[start:end].strip()
+            if body:
+                parts.append(f"{prefix_block}\n{body}" if prefix_block else body)
+        return parts or [stripped]
 
     def generate_ontology_updates_markdown(self) -> str:
         """Generate a markdown string representing the chain of ontology updates.
@@ -626,7 +579,7 @@ class AgentState(BasePydanticModel):
         Returns:
             str: The document namespace.
         """
-        return iri2namespace(self.doc_iri, ontology=False)
+        return normalize_namespace_iri(self.doc_iri, context="facts")
 
     @property
     def graph_uri(self):
@@ -635,13 +588,14 @@ class AgentState(BasePydanticModel):
         return self.doc_namespace
 
     @property
-    def ontology_id(self):
-        """Get the document namespace.
-
-        Returns:
-            str: The document namespace.
-        """
-        return self.current_ontology.ontology_id
+    def ontology_ids(self) -> list[str]:
+        """Ontology ids for all current ontology artifacts."""
+        artifacts = (
+            self.reduced_ontology_artifacts
+            if self.reduced_ontology_artifacts
+            else self.ontology_artifacts
+        )
+        return [ontology.ontology_id for ontology in artifacts if ontology.ontology_id]
 
     def get_context_for_agent(self, agent_type: AgentType) -> AgentContext:
         """Get or create context for a specific agent.

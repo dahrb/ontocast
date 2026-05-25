@@ -9,10 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from rdflib import DCTERMS, OWL, RDF, RDFS, XSD, Literal, URIRef
 
 from ontocast.onto.constants import DEFAULT_DOMAIN, ONTOLOGY_NULL_IRI, PROV
+from ontocast.onto.iri_policy import normalize_namespace_iri
+from ontocast.onto.llm_graph_payload import LLMGraphWire
 from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.onto.sparql_models import GraphUpdate, TripleOp
 from ontocast.onto.util import derive_ontology_id
-from ontocast.util import iri2namespace
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class OntologyProperties(BaseModel):
         Returns:
             str: The namespace string.
         """
-        return iri2namespace(self.iri, ontology=True)
+        return normalize_namespace_iri(self.iri, context="ontology")
 
 
 class OntologyPropertiesWithLineage(OntologyProperties):
@@ -131,13 +132,18 @@ class OntologyPropertiesWithLineage(OntologyProperties):
             >>> ont2.versioned_iri
             'http://example.org/ontology#v1.0.0'
         """
+        base = self.iri
         if self.hash:
             # Use hash-based fragment for git-style versioning
-            return f"{self.iri}#{self.hash}"
-        elif self.version:
+            if base.endswith("#"):
+                return f"{base}{self.hash}"
+            return f"{base}#{self.hash}"
+        if self.version:
             # Fall back to semantic version fragment for backward compatibility
-            return f"{self.iri}#v{self.version}"
-        return self.iri
+            if base.endswith("#"):
+                return f"{base}v{self.version}"
+            return f"{base}#v{self.version}"
+        return base
 
 
 class Ontology(OntologyPropertiesWithLineage):
@@ -149,10 +155,12 @@ class Ontology(OntologyPropertiesWithLineage):
             if ontology_id is set.
     """
 
-    graph: RDFGraph = Field(
+    graph: LLMGraphWire = Field(
         default_factory=RDFGraph,
-        description="RDF triples that define an ontology "
-        "in turtle format: use prefixes for namespaces, do NOT add comments.",
+        description=(
+            "RDF triples that define an ontology. "
+            "Encoding is defined by deployment llm_graph_format and OUTPUT INSTRUCTION."
+        ),
     )
 
     current_domain: str = Field(
@@ -160,6 +168,23 @@ class Ontology(OntologyPropertiesWithLineage):
     )
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def _apply_iri_fragment_hash_or_version(self) -> None:
+        """Normalize IRI when it carries a trailing hash or semantic-version fragment."""
+        if not self.iri or "#" not in self.iri:
+            return
+        base_iri, fragment = self.iri.rsplit("#", 1)
+        if len(fragment) > 20 and all(c in "0123456789abcdef" for c in fragment):
+            if self.hash is None:
+                self.hash = fragment
+            self.iri = base_iri
+            logger.debug("Extracted hash from IRI fragment: %s", fragment)
+        elif fragment.startswith("v") and re.match(r"^v\d+\.\d+\.\d+$", fragment):
+            version_str = fragment[1:]
+            if self.version is None:
+                self.version = version_str
+            self.iri = base_iri
+            logger.debug("Extracted version from IRI fragment: %s", version_str)
 
     def __init__(self, **kwargs):
         # Pop current_domain if provided, else use DEFAULT_DOMAIN
@@ -178,23 +203,7 @@ class Ontology(OntologyPropertiesWithLineage):
             # This is explicitly a null ontology - don't derive ontology_id, don't compute hash, etc.
             return
 
-        # Parse IRI fragment for hash-based or version-based identifiers
-        if self.iri and "#" in self.iri:
-            base_iri, fragment = self.iri.rsplit("#", 1)
-            # Check if fragment is a hash (long hex string) or version (v1.2.3)
-            if len(fragment) > 20 and all(c in "0123456789abcdef" for c in fragment):
-                # Looks like a hash - extract it
-                if self.hash is None:
-                    self.hash = fragment
-                    self.iri = base_iri  # Remove fragment from IRI
-                    logger.debug(f"Extracted hash from IRI fragment: {fragment}")
-            elif fragment.startswith("v") and re.match(r"^v\d+\.\d+\.\d+$", fragment):
-                # Semantic version fragment - extract version
-                version_str = fragment[1:]  # Remove 'v' prefix
-                if self.version is None:
-                    self.version = version_str
-                self.iri = base_iri  # Remove fragment from IRI
-                logger.debug(f"Extracted version from IRI fragment: {version_str}")
+        self._apply_iri_fragment_hash_or_version()
 
         # Try to sync from graph first (this is the primary source of truth)
         graph_had_ontology = False
@@ -313,10 +322,8 @@ class Ontology(OntologyPropertiesWithLineage):
         Returns:
             bool: True if this is NULL_ONTOLOGY or has null characteristics.
         """
-        from ontocast.onto.null import NULL_ONTOLOGY
-
-        # Check identity first (fastest)
-        if self is NULL_ONTOLOGY:
+        # Check identity first (fastest); singleton imported after class definition
+        if self is _NULL_ONTOLOGY_SINGLETON:
             return True
         # Check characteristics
         return self.iri == ONTOLOGY_NULL_IRI and self.ontology_id is None
@@ -328,10 +335,11 @@ class Ontology(OntologyPropertiesWithLineage):
         if graph does not provide a valid pair.
         """
         for k, v in kwargs.items():
-            if hasattr(self, k):
-                current = getattr(self, k)
-                if not current and v:
-                    setattr(self, k, v)
+            if k not in self.model_fields:
+                continue
+            current = getattr(self, k)
+            if not current and v:
+                setattr(self, k, v)
         # Try to sync from graph first
         graph_had_ontology = False
         if self.graph:
@@ -835,7 +843,7 @@ class Ontology(OntologyPropertiesWithLineage):
             return None
 
         # Try exact IRI match first
-        ontology_namespace = iri2namespace(self.iri, ontology=True)
+        ontology_namespace = normalize_namespace_iri(self.iri, context="ontology")
 
         for prefix, namespace_uri in self.graph.namespaces():
             namespace_str = str(namespace_uri)
@@ -872,7 +880,7 @@ class Ontology(OntologyPropertiesWithLineage):
         if not self.graph or not self.iri or self.iri == ONTOLOGY_NULL_IRI:
             return
 
-        ontology_namespace = iri2namespace(self.iri, ontology=True)
+        ontology_namespace = normalize_namespace_iri(self.iri, context="ontology")
 
         # Find the namespace URI for the old prefix
         old_namespace_uri = None
@@ -1095,7 +1103,9 @@ class Ontology(OntologyPropertiesWithLineage):
         """
         graph: RDFGraph = RDFGraph()
         graph.parse(file_path, format=format)
-        return cls(graph=graph, **kwargs)
+        ontology = cls(graph=graph, **kwargs)
+        ontology.graph.bind_implicit_namespaces(prefix_base=ontology.ontology_id)
+        return ontology
 
     def describe(self) -> str:
         """Get a human-readable description of the ontology.
@@ -1279,3 +1289,7 @@ class Ontology(OntologyPropertiesWithLineage):
                 logger.warning(warning)
 
         return warnings
+
+
+# Import null singleton after Ontology class (avoids circular import).
+from ontocast.onto.null import NULL_ONTOLOGY as _NULL_ONTOLOGY_SINGLETON  # noqa: E402

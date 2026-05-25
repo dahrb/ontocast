@@ -4,15 +4,23 @@ This module provides hierarchical configuration classes that map to the
 environment variables and usage patterns in the OntoCast system.
 """
 
+from __future__ import annotations
+
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from qdrant_client.http.models import Distance as QdrantDistance
 
-from ontocast.onto.constants import DEFAULT_DATASET, DEFAULT_ONTOLOGIES_DATASET
-from ontocast.onto.enum import RenderMode
+from ontocast.onto.enum import LLMGraphFormat, OntologyContextMode, RenderMode
+from ontocast.onto.tenancy import (
+    DEFAULT_PROJECT,
+    DEFAULT_TENANT,
+    tenant_project_facts_name,
+    tenant_project_ontologies_name,
+)
 
 
 class LLMProvider(StrEnum):
@@ -47,6 +55,13 @@ class OllamaModel(LLMModelNameAbstract):
     LLAMA3_1_70B = "llama3.1:70b"
     GRANITE3_3_2B = "granite3.3:2b"
     GRANITE3_3_8B = "granite3.3:8b"
+    GRANITE4_1_3B = "granite4.1:3b"
+    GRANITE4_1_8B = "granite4.1:8b"
+    GRANITE4_1_30B = "granite4.1:30b"
+    QWEN3_6_LATEST = "qwen3.6:latest"
+    QWEN3_6_27B = "qwen3.6:27b"
+    QWEN3_6_35B = "qwen3.6:35b"
+    KIMI_K2_6_CLOUD = "kimi-k2.6:cloud"
 
 
 LLMModelName = OpenAIModel | OllamaModel
@@ -56,6 +71,21 @@ class WebSearchProvider(StrEnum):
     """Supported web-search providers."""
 
     DUCKDUCKGO = "duckduckgo"
+
+
+class EmbeddingProvider(StrEnum):
+    """Supported embedding providers."""
+
+    OPENAI = "openai"
+    HUGGINGFACE = "huggingface"
+    OLLAMA = "ollama"
+
+
+class QdrantDedupMode(StrEnum):
+    """How Qdrant point identity is derived during upsert."""
+
+    ATOM_ID = "atom_id"
+    IRI = "iri"
 
 
 class LLMConfig(BaseSettings):
@@ -138,6 +168,28 @@ class ServerConfig(BaseSettings):
         default=RenderMode.ONTOLOGY_AND_FACTS,
         description="Rendering mode: ontology, facts, or ontology_and_facts.",
     )
+    llm_graph_format: LLMGraphFormat = Field(
+        default=LLMGraphFormat.TURTLE,
+        description=(
+            "Format used by the LLM when emitting RDF graph payloads: "
+            "'turtle' (legacy, Turtle strings) or 'jsonld' (compact JSON-LD objects)."
+        ),
+    )
+    ontology_context_mode: OntologyContextMode = Field(
+        default=OntologyContextMode.SELECTED_SINGLE_ONTOLOGY,
+        description=(
+            "Per-unit ontology context: selected_single_ontology (LLM-picked catalog), "
+            "selected_vector_search_ontology (Qdrant stitched ensemble), or "
+            "fixed_single_ontology (catalog ontology_id; requires ontology_context_fixed_ontology_id)."
+        ),
+    )
+    ontology_context_fixed_ontology_id: str = Field(
+        default="",
+        description=(
+            "Catalog ontology id when ontology_context_mode is fixed_single_ontology "
+            "(batch/server default from env)."
+        ),
+    )
     ontology_max_triples: int | None = Field(
         default=50000,
         description="Maximum number of triples allowed in ontology graph. "
@@ -183,18 +235,43 @@ class Neo4jConfig(BaseSettings):
 class FusekiConfig(BaseSettings):
     """Fuseki triple store configuration."""
 
-    uri: str | None = Field(default=None, description="Fuseki URI")
+    uri: str | None = Field(
+        default=None,
+        description=(
+            "Fuseki HTTP server root (e.g. http://localhost:3030), not a dataset "
+            "path or #/dataset/... UI URL; use FUSEKI_DATASET for the dataset name."
+        ),
+    )
     auth: str | None = Field(default=None, description="Fuseki authentication")
-    dataset: str = Field(default=DEFAULT_DATASET, description="Fuseki dataset name")
-    ontologies_dataset: str = Field(
-        default=DEFAULT_ONTOLOGIES_DATASET,
-        description="Fuseki dataset name for ontologies",
+    dataset: str | None = Field(
+        default=None,
+        description=(
+            "Facts dataset name; if unset, derived from built-in default "
+            f"tenant/project ({DEFAULT_TENANT!r}/{DEFAULT_PROJECT!r})."
+        ),
+    )
+    ontologies_dataset: str | None = Field(
+        default=None,
+        description=(
+            "Ontologies dataset; if unset, derived from the same default tenant/project "
+            "as dataset (not read from the environment)."
+        ),
     )
 
     model_config = SettingsConfigDict(
         env_prefix="FUSEKI_",
         case_sensitive=False,
     )
+
+    @model_validator(mode="after")
+    def _resolve_fuseki_datasets(self) -> FusekiConfig:
+        if self.dataset is None:
+            self.dataset = tenant_project_facts_name(DEFAULT_TENANT, DEFAULT_PROJECT)
+        if self.ontologies_dataset is None:
+            self.ontologies_dataset = tenant_project_ontologies_name(
+                DEFAULT_TENANT, DEFAULT_PROJECT
+            )
+        return self
 
 
 class DomainConfig(BaseSettings):
@@ -357,6 +434,287 @@ class AggregationConfig(BaseSettings):
     )
 
 
+class EmbeddingConfig(BaseSettings):
+    """Embedding provider settings used by vector stores."""
+
+    provider: EmbeddingProvider = Field(
+        default=EmbeddingProvider.HUGGINGFACE, description="Embedding model provider"
+    )
+    model_name: str = Field(
+        default="paraphrase-multilingual-MiniLM-L12-v2",
+        description="Embedding model identifier used by the selected provider.",
+    )
+    api_key: str | None = Field(
+        default=None, description="Provider API key for hosted embedding services."
+    )
+    base_url: str | None = Field(
+        default=None, description="Provider base URL (for Ollama-compatible endpoints)."
+    )
+    dimension: int = Field(
+        default=384,
+        ge=1,
+        description="Expected dense embedding vector size for core and neighborhood vectors.",
+    )
+    bm25_model_name: str = Field(
+        default="Qdrant/bm25",
+        description="fastembed SparseTextEmbedding model id for the BM25 sparse lane.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="EMBEDDING_",
+        case_sensitive=False,
+    )
+
+
+class PatchRetrievalConfig(BaseSettings):
+    """Scoring, filtering, and capping of ontology atoms after vector search (backend-agnostic)."""
+
+    per_query_core_score_ratio: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Within each query, keep core hits whose score is at least this fraction "
+            "of that query's best core score."
+        ),
+    )
+    per_query_neighborhood_score_ratio: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Within each query, keep neighborhood hits whose score is at least this "
+            "fraction of that query's best neighborhood score."
+        ),
+    )
+    min_core_query_best_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "If > 0, queries whose top core score is below this contribute no core hits."
+        ),
+    )
+    min_neighborhood_query_best_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "If > 0, queries whose top neighborhood score is below this contribute no "
+            "neighborhood hits."
+        ),
+    )
+    per_query_bm25_score_ratio: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Within each query, keep BM25 hits whose score is at least this fraction "
+            "of that query's best BM25 score."
+        ),
+    )
+    min_bm25_query_best_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "If > 0, queries whose top BM25 score is below this contribute no BM25 hits."
+        ),
+    )
+    min_merged_max_score: float = Field(
+        default=0.18,
+        ge=0.0,
+        description=(
+            "After merging hits across queries, if the highest retained score is below this, "
+            "return an empty patch (no relevant ontology). Set to 0 to disable (fused "
+            "cosine-style scores; tune with your embedding model)."
+        ),
+    )
+    merged_score_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "After merging hits across queries, keep atoms whose score is at least this "
+            "fraction of the merged top score. 0 disables."
+        ),
+    )
+    mmr_lambda: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "MMR trade-off over dense core+neighborhood vectors: 1.0 keeps pure relevance, "
+            "0.0 maximizes diversity."
+        ),
+    )
+    max_atoms: int = Field(
+        default=0,
+        ge=0,
+        description="Hard cap for retained atoms after filtering / MMR (0 means unlimited).",
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="ONTOLOGY_PATCH_",
+        case_sensitive=False,
+    )
+
+
+class QdrantConfig(BaseSettings):
+    """Qdrant vector store settings."""
+
+    uri: str | None = Field(default=None, description="Qdrant HTTP endpoint URI.")
+    api_key: str | None = Field(default=None, description="Qdrant API key.")
+    ontology_collection: str | None = Field(
+        default=None,
+        description="Qdrant collection for ontology atom vectors; derived when unset.",
+    )
+    facts_collection: str | None = Field(
+        default=None,
+        description=(
+            "Qdrant collection reserved for future fact vectors; created on init."
+        ),
+    )
+    grpc_port: int = Field(default=6334, description="Qdrant gRPC port.")
+    use_grpc: bool = Field(default=False, description="Use gRPC client transport.")
+    vector_size: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Vector size override. When set, must equal EmbeddingConfig.dimension; "
+            "when unset, the embedding dimension is used."
+        ),
+    )
+    distance: QdrantDistance = Field(
+        default=QdrantDistance.COSINE,
+        description=(
+            "Qdrant vector distance when creating collections "
+            "(Cosine, Dot, Euclid, Manhattan; same as qdrant_client Distance)."
+        ),
+    )
+    top_k: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Default number of fused vector hits per query for ontology-patch retrieval "
+            "(QDRANT_TOP_K). Call sites may pass an explicit ``top_k`` to override this "
+            "for a single retrieval; when omitted, patch search uses this value."
+        ),
+    )
+    induced_subgraph_depth: int = Field(
+        default=1,
+        ge=0,
+        description="Neighborhood expansion depth for induced subgraph retrieval.",
+    )
+    induced_subgraph_max_total_triples: int = Field(
+        default=300,
+        ge=1,
+        description="Hard cap on triples returned for induced subgraph retrieval.",
+    )
+    induced_subgraph_estimated_triples_per_query: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            "Estimated triple budget per proposition/query used to shape per-entity "
+            "allocation in induced subgraph retrieval."
+        ),
+    )
+    proposition_window_sentences: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="Sentence window size used for proposition-level retrieval slicing.",
+    )
+    proposition_max_windows: int = Field(
+        default=16,
+        ge=1,
+        description="Upper bound on proposition windows generated per document excerpt.",
+    )
+    proposition_retrieval_enabled: bool = Field(
+        default=True,
+        description="Enable proposition-level multi-query retrieval for induced graph mode.",
+    )
+    consistency_critic_similarity_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Minimum vector retrieval score to report potential cross-ontology conflicts.",
+    )
+    embedding_batch_size: int = Field(
+        default=64,
+        ge=1,
+        description="Batch size used for embedding requests during indexing.",
+    )
+    upsert_batch_size: int = Field(
+        default=256,
+        ge=1,
+        description="Batch size used for Qdrant upsert operations.",
+    )
+    fusion_core_weight: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Core vector score weight for dual-vector ranking fusion.",
+    )
+    fusion_neighborhood_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Neighborhood vector score weight for dual-vector ranking fusion.",
+    )
+    fusion_bm25_weight: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "BM25 sparse-lane weight for rank fusion (normalized with core and "
+            "neighborhood weights when BM25 retrieval is enabled)."
+        ),
+    )
+    dedup_mode: QdrantDedupMode = Field(
+        default=QdrantDedupMode.IRI,
+        description=(
+            "Point identity policy for ontology vectors: 'iri' stores one logical point "
+            "per entity key, while 'atom_id' keeps every atom variant as a separate point."
+        ),
+    )
+    dedup_include_version: bool = Field(
+        default=True,
+        description=(
+            "When dedup_mode='iri', include ontology_version in the identity key so "
+            "different ontology versions remain isolated."
+        ),
+    )
+    dedup_include_hash: bool = Field(
+        default=True,
+        description=(
+            "When dedup_mode='iri', include ontology_hash in the identity key so "
+            "different ontology snapshots remain isolated."
+        ),
+    )
+    dedup_query_hits_by_iri: bool = Field(
+        default=True,
+        description=(
+            "Drop duplicate retrieval hits sharing the same logical IRI key and keep "
+            "the best-scoring one."
+        ),
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="QDRANT_",
+        case_sensitive=False,
+    )
+
+    @model_validator(mode="after")
+    def _resolve_qdrant_collections(self) -> QdrantConfig:
+        if self.ontology_collection is None:
+            self.ontology_collection = tenant_project_ontologies_name(
+                DEFAULT_TENANT, DEFAULT_PROJECT
+            )
+        if self.facts_collection is None:
+            self.facts_collection = tenant_project_facts_name(
+                DEFAULT_TENANT, DEFAULT_PROJECT
+            )
+        return self
+
+
 class ToolConfig(BaseSettings):
     """Configuration for tools (LLM, triple stores, paths, chunking)."""
 
@@ -368,6 +726,12 @@ class ToolConfig(BaseSettings):
     domain: DomainConfig = Field(default_factory=DomainConfig)
     web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     aggregation: AggregationConfig = Field(default_factory=AggregationConfig)
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    patch_retrieval: PatchRetrievalConfig = Field(
+        default_factory=PatchRetrievalConfig,
+        description="Ontology patch retrieval: post-vector scoring, MMR, and limits.",
+    )
+    qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
 
 
 class Config(BaseSettings):
@@ -380,11 +744,18 @@ class Config(BaseSettings):
     # Tool configuration (for ToolBox)
     tool_config: ToolConfig = Field(default_factory=ToolConfig)
 
-    # Server configuration (for serve.py)
+    # Server configuration (for server.py)
     server: ServerConfig = Field(default_factory=ServerConfig)
 
     # Additional settings
     logging_level: str | None = Field(default=None, description="Logging level")
+    clean: bool = Field(
+        default=False,
+        description=(
+            "When true, ``--input-path`` batch mode flushes the triple store "
+            "(configured datasets) before loading ontologies."
+        ),
+    )
 
     model_config = SettingsConfigDict(
         case_sensitive=False,

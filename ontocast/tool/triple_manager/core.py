@@ -5,17 +5,26 @@ abstract interfaces and concrete implementations for different triple store back
 """
 
 import abc
+import asyncio
 import os
+from typing import ClassVar
 
 from pydantic import Field
 from rdflib import Graph
 
+from ontocast.onto.constants import PROV, RDF_REIFIES, SCHEMA
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.tool import Tool
 
 
 class TripleStoreManager(Tool):
+    _PROVENANCE_METADATA_PREDICATES: ClassVar[set] = {
+        PROV.generatedAtTime,
+        SCHEMA.position,
+        SCHEMA.identifier,
+    }
+
     """Base class for managing RDF triple stores.
 
     This class defines the interface for triple store management operations,
@@ -45,6 +54,10 @@ class TripleStoreManager(Tool):
             list[Ontology]: List of available ontologies with their graphs.
         """
         return []
+
+    async def afetch_ontologies(self) -> list[Ontology]:
+        """Async fetch helper for backends without native async I/O."""
+        return await asyncio.to_thread(self.fetch_ontologies)
 
     @abc.abstractmethod
     def serialize_graph(self, graph: Graph, **kwargs) -> bool | None:
@@ -80,24 +93,54 @@ class TripleStoreManager(Tool):
         """
         pass
 
+    async def aserialize(self, o: Ontology | RDFGraph, **kwargs) -> bool | None:
+        """Async serialize helper for backends without native async I/O."""
+        return await asyncio.to_thread(self.serialize, o, **kwargs)
+
+    @classmethod
+    def strip_provenance(cls, graph: Graph) -> RDFGraph:
+        """Return a graph without reification/provenance scaffolding triples."""
+        clean = RDFGraph()
+        for prefix, namespace in graph.namespaces():
+            clean.bind(prefix, namespace)
+
+        reifier_nodes = set(graph.subjects(RDF_REIFIES, None))
+        source_nodes = set(graph.objects(None, PROV.wasDerivedFrom))
+
+        for subject, predicate, object_ in graph:
+            if predicate in {RDF_REIFIES, PROV.wasDerivedFrom}:
+                continue
+            if subject in reifier_nodes:
+                continue
+            if subject in source_nodes:
+                continue
+            clean.add((subject, predicate, object_))
+
+        return clean
+
     @abc.abstractmethod
-    async def clean(self, dataset: str | None = None) -> None:
-        """Clean/flush data from the triple store.
+    async def clean(self) -> None:
+        """Clean/flush data managed by this store (backend-specific scope).
 
-        This method removes data from the triple store. For Fuseki, the optional
-        dataset parameter allows cleaning a specific dataset, or all datasets if None.
-        For Neo4j and Filesystem, the dataset parameter is ignored.
-
-        Args:
-            dataset: Optional dataset name to clean (Fuseki only). If None, cleans
-                all data. For other stores, this parameter is ignored.
-
-        Warning: This operation is irreversible and will delete all data.
+        Warning: This operation is irreversible and will delete data.
 
         Raises:
             NotImplementedError: If the triple store doesn't support cleaning.
         """
         raise NotImplementedError("clean() method must be implemented by subclasses")
+
+    def supports_tenancy_partition(self) -> bool:
+        """True if this backend isolates facts/ontologies by :func:`tenant_project_*` names."""
+        return False
+
+    async def clean_tenancy(self, tenant: str, project: str) -> None:
+        """Remove all triples for datasets derived from ``tenant`` / ``project``.
+
+        Backends without per-tenant partitions raise :class:`NotImplementedError`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not isolate data by tenant/project"
+        )
 
 
 class TripleStoreManagerWithAuth(TripleStoreManager):

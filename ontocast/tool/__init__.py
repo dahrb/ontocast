@@ -25,6 +25,7 @@ Example:
 
 from ontocast.tool.chunk.chunker import ChunkerTool
 
+from .agg.aggregate import EmbeddingBasedAggregator
 from .atomic import AtomicToolBox, SearchHit
 from .converter import ConverterTool
 from .llm import LLMTool
@@ -36,6 +37,7 @@ from .triple_manager import (
     Neo4jTripleStoreManager,
     TripleStoreManager,
 )
+from .vector_store import EmbeddingTool, OntologyPatchRetriever, QdrantVectorStore
 
 __all__ = [
     "LLMTool",
@@ -49,4 +51,8 @@ __all__ = [
     "Tool",
     "AtomicToolBox",
     "SearchHit",
+    "EmbeddingTool",
+    "QdrantVectorStore",
+    "OntologyPatchRetriever",
+    "EmbeddingBasedAggregator",
 ]

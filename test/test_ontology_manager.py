@@ -9,6 +9,7 @@ This test suite ensures that:
 """
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -657,3 +658,98 @@ class TestRecreateFromRDFGraph:
         # Verify created_at was preserved
         assert recreated_ontology.created_at is not None
         assert recreated_ontology.created_at == original_time
+
+
+class TestOntologyManagerVectorAndRemoval:
+    """Vector indexing flags and IRI removal."""
+
+    def test_add_ontology_skip_vector_index_skips_reindex(
+        self, ontology_manager, sample_ontology
+    ):
+        patch_retriever = MagicMock()
+        patch_retriever.vector_store = MagicMock()
+        ontology_manager.register_vector_store(patch_retriever)
+        ontology_manager.add_ontology(sample_ontology, skip_vector_index=True)
+        patch_retriever.vector_store.reindex_ontology.assert_not_called()
+
+    def test_add_ontology_reindexes_by_default(self, ontology_manager, sample_ontology):
+        patch_retriever = MagicMock()
+        patch_retriever.vector_store = MagicMock()
+        ontology_manager.register_vector_store(patch_retriever)
+        ontology_manager.add_ontology(sample_ontology)
+        patch_retriever.vector_store.reindex_ontology.assert_called_once()
+
+    def test_remove_ontology_by_iri_clears_versions(
+        self, ontology_manager, sample_ontology
+    ):
+        ontology_manager.add_ontology(sample_ontology)
+        ontology_manager.remove_ontology_by_iri(sample_ontology.iri)
+        assert sample_ontology.iri not in ontology_manager.ontology_versions
+        assert sample_ontology.iri not in ontology_manager._cached_ontologies
+
+
+class TestOntologyIdentityGuards:
+    """Strict IRI<->identity guardrails."""
+
+    def test_rejects_same_iri_with_different_identity(
+        self, ontology_manager: OntologyManager
+    ) -> None:
+        base_graph = RDFGraph._from_turtle_str(
+            """
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            <https://example.org/finance> a owl:Ontology .
+            """
+        )
+        ontology_a = Ontology(
+            graph=base_graph,
+            iri="https://example.org/finance",
+            ontology_id="finance",
+        )
+        ontology_manager.add_ontology(ontology_a)
+
+        conflicting_graph = RDFGraph._from_turtle_str(
+            """
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            <https://example.org/finance> a owl:Ontology .
+            <https://example.org/finance#extra> a owl:Class .
+            """
+        )
+        ontology_b = Ontology(
+            graph=conflicting_graph,
+            iri="https://example.org/finance",
+            ontology_id="accounting",
+        )
+
+        with pytest.raises(ValueError, match="already bound to identity"):
+            ontology_manager.add_ontology(ontology_b)
+
+    def test_rejects_same_identity_with_different_iri(
+        self, ontology_manager: OntologyManager
+    ) -> None:
+        graph_a = RDFGraph._from_turtle_str(
+            """
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            <https://example.org/finance> a owl:Ontology .
+            """
+        )
+        ontology_a = Ontology(
+            graph=graph_a,
+            iri="https://example.org/finance",
+            ontology_id="finance",
+        )
+        ontology_manager.add_ontology(ontology_a)
+
+        graph_b = RDFGraph._from_turtle_str(
+            """
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            <https://example.com/finance> a owl:Ontology .
+            """
+        )
+        ontology_b = Ontology(
+            graph=graph_b,
+            iri="https://example.com/finance",
+            ontology_id="finance",
+        )
+
+        with pytest.raises(ValueError, match="already bound to IRI"):
+            ontology_manager.add_ontology(ontology_b)

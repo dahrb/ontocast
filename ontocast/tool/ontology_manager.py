@@ -6,6 +6,8 @@ lineage using hash-based identifiers.
 """
 
 import logging
+from copy import deepcopy
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -15,6 +17,9 @@ from ..onto.rdfgraph import RDFGraph
 from .onto import Tool
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ontocast.tool.vector_store.patch_retriever import OntologyPatchRetriever
 
 
 class OntologyManager(Tool):
@@ -42,6 +47,50 @@ class OntologyManager(Tool):
         # Cache dictionary mapping IRI to hash of freshest terminal ontology.
         # Updated incrementally when ontologies are added.
         self._cached_ontologies: dict[str, str] = {}
+        self._patch_retriever: OntologyPatchRetriever | None = None
+        self._iri_to_identity: dict[str, str] = {}
+        self._identity_to_iri: dict[str, str] = {}
+
+    @staticmethod
+    def _build_identity_key(ontology: Ontology) -> str:
+        identity = (ontology.ontology_id or ontology.prefix or "").strip().lower()
+        if not identity:
+            raise ValueError(
+                "Ontology identity is missing: provide ontology_id or ontology prefix"
+            )
+        return identity
+
+    def validate_identity_uniqueness(self, ontology: Ontology) -> None:
+        """Validate ontology IRI<->identity bijection across the manager."""
+        iri = (ontology.iri or "").strip()
+        if not iri:
+            raise ValueError("Ontology IRI is missing")
+        if iri == NULL_ONTOLOGY.iri:
+            raise ValueError("Null ontology IRI cannot be registered")
+
+        identity = self._build_identity_key(ontology)
+
+        existing_identity = self._iri_to_identity.get(iri)
+        if existing_identity is not None and existing_identity != identity:
+            raise ValueError(
+                "Ontology identity conflict: IRI "
+                f"'{iri}' is already bound to identity '{existing_identity}', "
+                f"received '{identity}'"
+            )
+
+        existing_iri = self._identity_to_iri.get(identity)
+        if existing_iri is not None and existing_iri != iri:
+            raise ValueError(
+                "Ontology identity conflict: identity "
+                f"'{identity}' is already bound to IRI '{existing_iri}', "
+                f"received '{iri}'"
+            )
+
+    def _register_identity(self, ontology: Ontology) -> None:
+        iri = ontology.iri.strip()
+        identity = self._build_identity_key(ontology)
+        self._iri_to_identity[iri] = identity
+        self._identity_to_iri[identity] = iri
 
     def __contains__(self, item):
         """Check if an item (IRI or ontology_id) is in the ontology manager.
@@ -62,7 +111,9 @@ class OntologyManager(Tool):
                     return True
         return False
 
-    def add_ontology(self, ontology: Ontology) -> None:
+    def add_ontology(
+        self, ontology: Ontology, *, skip_vector_index: bool = False
+    ) -> None:
         """Add an ontology to the version tree for its IRI.
 
         If an ontology with the same hash already exists, it is not added again.
@@ -71,6 +122,8 @@ class OntologyManager(Tool):
 
         Args:
             ontology: The ontology to add.
+            skip_vector_index: If True, do not call the vector store (caller
+                already materialized embeddings, e.g. during ToolBox.initialize).
         """
         if not ontology.iri or ontology.iri == NULL_ONTOLOGY.iri:
             logger.warning(
@@ -81,6 +134,9 @@ class OntologyManager(Tool):
         if not ontology.hash:
             logger.warning(f"Cannot add ontology without hash (IRI: {ontology.iri})")
             return
+
+        self.validate_identity_uniqueness(ontology)
+        self._register_identity(ontology)
 
         # Ensure created_at is set
         if not ontology.created_at:
@@ -98,6 +154,8 @@ class OntologyManager(Tool):
         existing_hashes = {o.hash for o in self.ontology_versions[ontology.iri]}
         if ontology.hash not in existing_hashes:
             self.ontology_versions[ontology.iri].append(ontology)
+            if self._patch_retriever is not None and not skip_vector_index:
+                self._patch_retriever.vector_store.reindex_ontology(ontology)
             # Update cache for this specific IRI (store hash only)
             freshest = self.get_freshest_terminal_ontology_by_iri(ontology.iri)
             if freshest and freshest.hash:
@@ -109,6 +167,167 @@ class OntologyManager(Tool):
             logger.debug(
                 f"Ontology {ontology.iri} with hash {ontology.hash[:8]}... already exists"
             )
+
+    def remove_ontology_by_iri(self, iri: str) -> None:
+        """Drop all tracked versions for an ontology IRI and clear caches."""
+        self.ontology_versions.pop(iri, None)
+        self._cached_ontologies.pop(iri, None)
+        removed_identity = self._iri_to_identity.pop(iri, None)
+        if removed_identity is not None:
+            self._identity_to_iri.pop(removed_identity, None)
+
+    def register_vector_store(self, retriever: "OntologyPatchRetriever") -> None:
+        """Register a patch retriever for vector context lookups."""
+        self._patch_retriever = retriever
+
+    def _effective_patch_top_k(self, top_k: int | None) -> int:
+        if top_k is not None:
+            return top_k
+        if self._patch_retriever is not None:
+            return self._patch_retriever.vector_store.config.top_k
+        return 10
+
+    def get_patch_context(
+        self,
+        query: str,
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> RDFGraph | None:
+        """Retrieve multi-ontology patch context for a query.
+
+        Falls back to the freshest available ontology graph if vector retrieval
+        is not configured or yields no atoms.
+        """
+        graph, _ = self.get_patch_context_with_sources(
+            query=query,
+            top_k=top_k,
+            subgraph_depth=subgraph_depth,
+            max_total_triples=max_total_triples,
+            estimated_triples_per_query=estimated_triples_per_query,
+        )
+        return graph
+
+    async def aget_patch_context(
+        self,
+        query: str,
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> RDFGraph | None:
+        """Async variant of :meth:`get_patch_context`."""
+        graph, _ = await self.aget_patch_context_with_sources(
+            query=query,
+            top_k=top_k,
+            subgraph_depth=subgraph_depth,
+            max_total_triples=max_total_triples,
+            estimated_triples_per_query=estimated_triples_per_query,
+        )
+        return graph
+
+    def get_patch_context_with_sources(
+        self,
+        query: str,
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> tuple[RDFGraph | None, list[str]]:
+        """Retrieve patch context and contributing ontology IRIs."""
+        results = self.get_patch_contexts_with_sources(
+            queries=[query],
+            top_k=top_k,
+            subgraph_depth=subgraph_depth,
+            max_total_triples=max_total_triples,
+            estimated_triples_per_query=estimated_triples_per_query,
+        )
+        if not results:
+            return None, []
+        return results[0]
+
+    async def aget_patch_context_with_sources(
+        self,
+        query: str,
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> tuple[RDFGraph | None, list[str]]:
+        """Async variant of :meth:`get_patch_context_with_sources`."""
+        results = await self.aget_patch_contexts_with_sources(
+            queries=[query],
+            top_k=top_k,
+            subgraph_depth=subgraph_depth,
+            max_total_triples=max_total_triples,
+            estimated_triples_per_query=estimated_triples_per_query,
+        )
+        if not results:
+            return None, []
+        return results[0]
+
+    def get_patch_contexts_with_sources(
+        self,
+        queries: list[str],
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> list[tuple[RDFGraph | None, list[str]]]:
+        """Retrieve patch contexts for many queries in a batched pass.
+
+        With a patch retriever, the list has length 1 (ensemble graph + sources).
+        Without it, length matches ``queries`` (fallback ontology per query).
+        """
+        if not queries:
+            return []
+        if self._patch_retriever is not None:
+            graph, sources = self._patch_retriever.retrieve_ensemble(
+                queries=queries,
+                top_k=self._effective_patch_top_k(top_k),
+                subgraph_depth=subgraph_depth,
+                max_total_triples=max_total_triples,
+                estimated_triples_per_query=estimated_triples_per_query,
+            )
+            return [(graph, sources) if len(graph) > 0 else (RDFGraph(), sources)]
+
+        fallback = self.get_freshest_terminal_ontology_by_iri(None)
+        if fallback is None:
+            return [(None, []) for _ in queries]
+        fallback_graph = deepcopy(fallback.graph)
+        return [(deepcopy(fallback_graph), [fallback.iri]) for _ in queries]
+
+    async def aget_patch_contexts_with_sources(
+        self,
+        queries: list[str],
+        top_k: int | None = None,
+        subgraph_depth: int = 1,
+        max_total_triples: int = 300,
+        estimated_triples_per_query: int = 24,
+    ) -> list[tuple[RDFGraph | None, list[str]]]:
+        """Async patch retrieval (vector + induced subgraph) for many queries.
+
+        With a patch retriever, returns a one-element list: a single induced graph for
+        the union of hits over ``queries``, plus contributing ontology IRIs.
+        """
+        if not queries:
+            return []
+        if self._patch_retriever is not None:
+            graph, sources = await self._patch_retriever.aretrieve_ensemble(
+                queries=queries,
+                top_k=self._effective_patch_top_k(top_k),
+                subgraph_depth=subgraph_depth,
+                max_total_triples=max_total_triples,
+                estimated_triples_per_query=estimated_triples_per_query,
+            )
+            return [(graph, sources) if len(graph) > 0 else (RDFGraph(), sources)]
+
+        fallback = self.get_freshest_terminal_ontology_by_iri(None)
+        if fallback is None:
+            return [(None, []) for _ in queries]
+        fallback_graph = deepcopy(fallback.graph)
+        return [(deepcopy(fallback_graph), [fallback.iri]) for _ in queries]
 
     def get_terminal_ontologies_by_iri(self, iri: str | None = None) -> list[Ontology]:
         """Get terminal (leaf) ontologies in the version graph.

@@ -42,25 +42,6 @@ The following facts were extracted
 """
 
 
-output_instruction_empty = """\n\n
-# OUTPUT INSTRUCTION
-
-"""
-
-output_instruction_ttl = """\n\n
-# OUTPUT INSTRUCTION
-
-1. ontology must be provided in turtle format as a single string
-2. define all prefixes for all namespaces used in the ontology, etc rdf, rdfs, owl, schema, etc.
-"""
-
-output_instruction_sparql = """\n\n
-# OUTPUT INSTRUCTION
-
-Generate SPARQL operations that modify the existing ontology, not replace it entirely.
-Follow the Pydantic schema definitions exactly - they fully specify the output structure.
-"""
-
 user_template = """\n\n
 # USER INSTRUCTION
 

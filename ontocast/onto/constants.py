@@ -1,12 +1,21 @@
 from rdflib import Namespace, URIRef
 
+from ontocast.onto.tenancy import (
+    DEFAULT_PROJECT,
+    DEFAULT_TENANT,
+    tenant_project_facts_name,
+    tenant_project_ontologies_name,
+)
+
 DEFAULT_DOMAIN = "https://growgraph.dev"
 ONTOLOGY_NULL_ID = "__null__"
-ONTOLOGY_NULL_IRI = f"{DEFAULT_DOMAIN}/{ONTOLOGY_NULL_ID}"
-DEFAULT_IRI = f"{DEFAULT_DOMAIN}/facts"
-CHUNK_NULL_IRI = f"{DEFAULT_DOMAIN}/__null__"
-DEFAULT_DATASET = "dataset0"
-DEFAULT_ONTOLOGIES_DATASET = "ontologies"
+ONTOLOGY_NULL_IRI = f"{DEFAULT_DOMAIN}/{ONTOLOGY_NULL_ID}/"
+DEFAULT_IRI = f"{DEFAULT_DOMAIN}/facts/"
+CHUNK_NULL_IRI = f"{DEFAULT_DOMAIN}/__null__/"
+DEFAULT_DATASET = tenant_project_facts_name(DEFAULT_TENANT, DEFAULT_PROJECT)
+DEFAULT_ONTOLOGIES_DATASET = tenant_project_ontologies_name(
+    DEFAULT_TENANT, DEFAULT_PROJECT
+)
 COMMON_PREFIXES = {
     "xsd": "<http://www.w3.org/2001/XMLSchema#>",
     "rdf": "<http://www.w3.org/1999/02/22-rdf-syntax-ns#>",
@@ -20,6 +29,30 @@ COMMON_PREFIXES = {
     "prov": "<http://www.w3.org/ns/prov#>",
     "ex": "<http://example.org/>",
 }
+
+# Cross-domain vocabularies merged only at LLM ingest repair (not default serialization).
+WELL_KNOWN_PREFIXES: dict[str, str] = {
+    "qudt": "http://qudt.org/schema/qudt/",
+    "unit": "http://qudt.org/vocab/unit/",
+    "quantitykind": "http://qudt.org/vocab/quantitykind/",
+    "om": "http://www.ontology-of-units-of-measure.org/resource/om-2/",
+    "geo": "http://www.w3.org/2003/01/geo/wgs84_pos#",
+    "time": "http://www.w3.org/2006/time#",
+    "sh": "http://www.w3.org/ns/shacl#",
+    "dcat": "http://www.w3.org/ns/dcat#",
+    "void": "http://rdfs.org/ns/void#",
+}
+
+
+def prefix_lookup_for_ingest() -> dict[str, str]:
+    """Prefix map for Turtle/JSON-LD ingest repair (COMMON + WELL_KNOWN, bare URIs)."""
+    lookup: dict[str, str] = {}
+    for prefix, uri in COMMON_PREFIXES.items():
+        lookup[prefix] = uri.strip("<>")
+    lookup.update(WELL_KNOWN_PREFIXES)
+    return lookup
+
+
 PROV = Namespace("http://www.w3.org/ns/prov#")
 SCHEMA = Namespace("https://schema.org/")
 

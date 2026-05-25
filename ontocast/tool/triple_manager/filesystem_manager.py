@@ -106,14 +106,49 @@ class FilesystemTripleStoreManager(TripleStoreManager):
             return
 
         fname: str = kwargs.pop("fname")
+        dump_clean_graph: bool = kwargs.pop("dump_clean_graph", False)
         output_path = self.working_directory / fname
-        graph.serialize(format="turtle", destination=output_path)
+        self._write_turtle(graph, output_path)
         logger.info(f"Graph saved to {output_path}")
+
+        if dump_clean_graph:
+            clean_graph = self.strip_provenance(graph)
+            clean_output_path = self.working_directory / self._with_suffix(
+                fname, "clean"
+            )
+            self._write_turtle(
+                clean_graph,
+                clean_output_path,
+                serialization_format="turtle",
+            )
+            logger.info(f"Graph without provenance saved to {clean_output_path}")
+
+    @staticmethod
+    def _with_suffix(fname: str, suffix: str) -> str:
+        path = pathlib.Path(fname)
+        return f"{path.stem}_{suffix}{path.suffix}"
+
+    @staticmethod
+    def _write_turtle(
+        graph: Graph,
+        output_path: pathlib.Path,
+        *,
+        serialization_format: str | None = None,
+    ) -> None:
+        # Use longturtle where available (non-oxigraph) for easier local inspection.
+        if serialization_format is None:
+            is_oxigraph = (
+                isinstance(graph, RDFGraph)
+                and type(graph.store).__name__ == "OxigraphStore"
+            )
+            serialization_format = "turtle" if is_oxigraph else "longturtle"
+        graph.serialize(format=serialization_format, destination=output_path)
 
     def serialize(self, o: Ontology | RDFGraph, graph_uri: str | None = None):  # type: ignore[override]
         if isinstance(o, Ontology):
             graph = o.graph
             fname = f"ontology_{o.ontology_id}_{o.version}.ttl"
+            dump_clean_graph = False
         elif isinstance(o, RDFGraph):
             graph = o
             if graph_uri:
@@ -122,30 +157,25 @@ class FilesystemTripleStoreManager(TripleStoreManager):
                 fname = f"facts_{s}.ttl"
             else:
                 fname = "facts_default.ttl"
+            dump_clean_graph = True
         else:
             raise TypeError(f"unsupported obj of type {type(o)} received")
 
-        self.serialize_graph(graph=graph, fname=fname)
+        self.serialize_graph(
+            graph=graph,
+            fname=fname,
+            dump_clean_graph=dump_clean_graph,
+        )
 
-    async def clean(self, dataset: str | None = None) -> None:
+    async def clean(self) -> None:
         """Clean/flush all data from the filesystem triple store.
 
         This method deletes all Turtle (.ttl) files from both the working
         directory and the ontology directory.
-
-        Args:
-            dataset: Optional dataset parameter (ignored for Filesystem, which doesn't
-                support datasets). Included for interface compatibility.
 
         Warning: This operation is irreversible and will delete all data.
 
         Raises:
             Exception: If the cleanup operation fails.
         """
-        if dataset is not None:
-            logger.warning(
-                f"Dataset parameter '{dataset}' ignored for Filesystem (datasets not supported)"
-            )
-            logger.warning(
-                "clean method not implemented for FilesystemTripleStoreManager"
-            )
+        logger.warning("clean method not implemented for FilesystemTripleStoreManager")

@@ -7,7 +7,13 @@ from pydantic import Field
 
 from ontocast.onto.constants import DEFAULT_DOMAIN
 from ontocast.onto.content_unit import ContentUnit, SourceUnit
-from ontocast.onto.enum import FailureStage, Status, WorkflowNode
+from ontocast.onto.enum import (
+    FailureStage,
+    LLMGraphFormat,
+    OntologyAssemblyMode,
+    Status,
+    WorkflowNode,
+)
 from ontocast.onto.model import (
     BasePydanticModel,
     ExternalEvidenceCacheEntry,
@@ -17,7 +23,7 @@ from ontocast.onto.model import (
     Suggestions,
 )
 from ontocast.onto.ontology import Ontology
-from ontocast.onto.rdfgraph import RDFGraph
+from ontocast.onto.rdfgraph import RDFGraph, RejectedLiteralTriple
 from ontocast.onto.sparql_models import GraphUpdate
 from ontocast.onto.state import AgentState, BudgetTracker
 
@@ -33,9 +39,20 @@ class UnitState(BasePydanticModel):
     """Common per-unit workflow state."""
 
     ontology_snapshot: Ontology = Field(description="Immutable ontology snapshot")
+    ontology_patch_sources: list[str] = Field(
+        default_factory=list,
+        description="Ontology IRIs that contributed to the snapshot context.",
+    )
     suggestions: Suggestions = Field(default_factory=Suggestions)
     budget_tracker: BudgetTracker = Field(default_factory=BudgetTracker)
     max_visits_per_node: int = Field(default=1, ge=1)
+    llm_graph_format: LLMGraphFormat = Field(
+        default=LLMGraphFormat.TURTLE,
+        description=(
+            "Format used by the LLM for emitting RDF graph payloads: "
+            "'turtle' or 'jsonld'."
+        ),
+    )
 
     status: Status = Field(default=Status.NOT_VISITED)
     failure_stage: FailureStage | None = Field(default=None)
@@ -138,6 +155,18 @@ class UnitFactsState(UnitState):
     content_unit: ContentUnit = Field(description="Unit under processing (mutable)")
     facts_user_instruction: str = Field(default="")
     facts_updates: list[GraphUpdate] = Field(default_factory=list)
+    quarantined_literal_triples: list[RejectedLiteralTriple] = Field(
+        default_factory=list,
+        description="Triples excluded from the applied graph due to invalid XSD typed literals.",
+    )
+    assembly_anchor_iri: str = Field(
+        default="",
+        description="Anchor IRI from context assembly (or merged document primary).",
+    )
+    assembly_mode_used: OntologyAssemblyMode = Field(
+        default=OntologyAssemblyMode.SELECTED_SINGLE_ONTOLOGY_LLM,
+        description="How ontology_snapshot was assembled for this unit.",
+    )
 
     def get_content_unit_progress_string(self) -> str:
         """Progress string for logging with content unit index."""
@@ -158,6 +187,14 @@ class UnitOntologyState(UnitState):
     """Independent per-unit state for ontology improvement loop."""
 
     content_unit: SourceUnit = Field(description="Unit under processing")
+    assembly_anchor_iri: str = Field(
+        default="",
+        description="Anchor IRI from resolve_unit_ontology_context prelude.",
+    )
+    assembly_mode_used: OntologyAssemblyMode = Field(
+        default=OntologyAssemblyMode.SELECTED_SINGLE_ONTOLOGY_LLM,
+        description="Ontology assembly mode from the context prelude.",
+    )
     ontology_user_instruction: str = Field(default="")
     current_ontology: Ontology = Field(
         default_factory=Ontology, description="Current ontology under refinement"

@@ -19,7 +19,7 @@ class OntologyDecision(StrEnum):
 
 
 class FactsDecision(StrEnum):
-    """Enumeration of Ontology Decisions used in the workflow."""
+    """Enumeration of routing decisions after ontology quality checks."""
 
     TEXT_TO_FACTS = "adequate ontology; render facts"
     TEXT_TO_ONTOLOGY = "inadequate ontology; retry render onto"
@@ -32,6 +32,35 @@ class RenderMode(StrEnum):
     ONTOLOGY = "ontology"
     FACTS = "facts"
     ONTOLOGY_AND_FACTS = "ontology_and_facts"
+
+
+class LLMGraphFormat(StrEnum):
+    """Format used by the LLM when emitting RDF graph payloads.
+
+    - ``turtle``: graph fields are Turtle strings (legacy behavior).
+    - ``jsonld``: graph fields are compact JSON-LD objects embedded directly
+      in the structured LLM response. Internally parsed back into ``RDFGraph``.
+    """
+
+    TURTLE = "turtle"
+    JSONLD = "jsonld"
+
+
+class OntologyContextMode(StrEnum):
+    """How per-unit ontology context is sourced before ontology/facts rendering."""
+
+    SELECTED_SINGLE_ONTOLOGY = "selected_single_ontology"
+    SELECTED_VECTOR_SEARCH_ONTOLOGY = "selected_vector_search_ontology"
+    FIXED_SINGLE_ONTOLOGY = "fixed_single_ontology"
+
+
+class OntologyAssemblyMode(StrEnum):
+    """How per-unit ontology context was assembled for prompts."""
+
+    SELECTED_SINGLE_ONTOLOGY_LLM = "selected_single_ontology_llm"
+    SELECTED_VECTOR_SEARCH_ENSEMBLE = "selected_vector_search_ensemble"
+    FIXED_SINGLE_ONTOLOGY = "fixed_single_ontology"
+    DOCUMENT_MERGED_REDUCED = "document_merged_reduced"
 
 
 class FailureStage(StrEnum):
@@ -47,11 +76,7 @@ class FailureStage(StrEnum):
         "Failed to generate SPARQL update for ontology"
     )
     GENERATE_TTL_FOR_FACTS = "Failed to generate semantic triples (turtle) for facts"
-    GENERATE_SPARQL_UPDATE_FOR_FACTS = "Failed to generate SPARQL update for ontology"
-    SUBLIMATE_ONTOLOGY = (
-        "The produced semantic could not be validated "
-        "or separated into ontology and facts (technical issue)."
-    )
+    GENERATE_SPARQL_UPDATE_FOR_FACTS = "Failed to generate SPARQL update for facts"
 
 
 class WorkflowNode(StrEnum):
@@ -66,8 +91,6 @@ class WorkflowNode(StrEnum):
     AGGREGATE_FACTS = "Aggregate Facts"
     SERIALIZE = "Serialize"
     PARALLEL_MAP_UNITS = "Parallel Map Units"
-    SELECT_ONTOLOGY = "Select Ontology"
-    BOOTSTRAP_ONTOLOGY = "Bootstrap Ontology"
     RENDER_ONTOLOGY_UPDATE = "Update Ontology"
     RENDER_FACTS = "Render Facts"
     NORMALIZE_ONTOLOGY_UPDATES = "Normalize Ontology Updates"
@@ -75,6 +98,8 @@ class WorkflowNode(StrEnum):
     MERGE_FACTS = "Merge Facts"
     PLAN_EXTERNAL_EVIDENCE = "Plan External Evidence"
     FETCH_EXTERNAL_EVIDENCE = "Fetch External Evidence"
+    STRUCTURAL_CHECK = "Structural Check"
+    CONSISTENCY_CRITIC = "Consistency Critic"
 
 
 class SPARQLOperationType(StrEnum):

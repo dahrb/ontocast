@@ -6,6 +6,7 @@ understandable.
 """
 
 import logging
+from collections.abc import Sequence
 
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import PromptTemplate
@@ -14,18 +15,21 @@ from ontocast.agent.common import call_llm_with_retry, render_suggestions_prompt
 from ontocast.onto.constants import DEFAULT_IRI
 from ontocast.onto.enum import FailureStage, Status, WorkflowNode
 from ontocast.onto.model import FactsRenderReport, GraphUpdateRenderReport
-from ontocast.onto.rdfgraph import RDFGraph
+from ontocast.onto.ontology import Ontology
+from ontocast.onto.ontology_access import (
+    UnitFactsOntologyAccess,
+    build_llm_prefix_map,
+    ontology_access_for_unit_facts,
+)
+from ontocast.onto.rdfgraph import RDFGraph, finalize_llm_graph
 from ontocast.onto.unit_states import UnitFactsState
-from ontocast.prompt.common import (
-    facts_template,
-    ontology_template,
-    output_instruction_empty,
-    output_instruction_sparql,
-    text_template,
-    user_template,
+from ontocast.prompt.common import text_template, user_template
+from ontocast.prompt.graph_format import get_graph_format_profile
+from ontocast.prompt.ontology_context import (
+    build_ontology_index,
+    format_ontologies_clause,
 )
 from ontocast.prompt.render_facts import (
-    facts_instruction_template,
     preamble,
     template_prompt,
 )
@@ -34,25 +38,11 @@ from ontocast.tool.atomic import AtomicToolBox
 logger = logging.getLogger(__name__)
 
 
-def _extract_known_prefixes(state: UnitFactsState) -> dict[str, str]:
-    """Extract ontology prefixes used to patch missing declarations in LLM TTL output."""
-    known_prefixes: dict[str, str] = {}
-
-    if state.ontology_snapshot and state.ontology_snapshot.graph:
-        for prefix, namespace_uri in state.ontology_snapshot.graph.namespaces():
-            if prefix:  # Skip empty prefixes
-                known_prefixes[prefix] = str(namespace_uri)
-
-    # Also add the ontology prefix explicitly if available.
-    if state.ontology_snapshot.prefix and state.ontology_snapshot.namespace:
-        known_prefixes[state.ontology_snapshot.prefix] = (
-            state.ontology_snapshot.namespace
-        )
-
-    return known_prefixes
-
-
-async def render_facts(state: UnitFactsState, tools: AtomicToolBox) -> UnitFactsState:
+async def render_facts(
+    state: UnitFactsState,
+    tools: AtomicToolBox,
+    supplemental_ontologies: Sequence[Ontology] | None = None,
+) -> UnitFactsState:
     """Structured hybrid facts renderer with Turtle/SPARQL decision logic.
 
     This function decides between generating bare Turtle for fresh facts
@@ -71,31 +61,45 @@ async def render_facts(state: UnitFactsState, tools: AtomicToolBox) -> UnitFacts
     progress_info = state.get_content_unit_progress_string()
     logger.info(f"Render facts for {progress_info}")
 
+    extras = list(supplemental_ontologies or ())
     if is_fresh_facts_graph:
         logger.info("Generating fresh facts as Turtle")
-        return await render_facts_fresh(state, tools)
+        return await render_facts_fresh(state, tools, supplemental_ontologies=extras)
     else:
         logger.info("Generating facts update")
-        return await render_facts_update(state, tools)
+        return await render_facts_update(state, tools, supplemental_ontologies=extras)
 
 
-def _prepare_prompt_data(state: UnitFactsState) -> dict[str, str]:
+def _prepare_prompt_data(
+    state: UnitFactsState,
+    access: UnitFactsOntologyAccess,
+    profile,
+) -> dict[str, str]:
     """Prepare common prompt data for both fresh and update rendering.
 
     Args:
         state: The current unit facts state
+        access: Read-only ontology context (facts prompts use snapshot only).
+        profile: Active graph format profile.
 
     Returns:
         Dictionary containing formatted prompt components
     """
-    ontology_chapter = ontology_template.format(
-        ontology_ttl=state.ontology_snapshot.graph.serialize(format="turtle")
-    )
+    ctx = access.effective_ontology_for_prompt()
+    if not isinstance(ctx.graph, RDFGraph):
+        normalized_graph = RDFGraph()
+        for triple in ctx.graph:
+            normalized_graph.add(triple)
+        for prefix, namespace_uri in ctx.graph.namespaces():
+            normalized_graph.bind(prefix, namespace_uri)
+        ctx.graph = normalized_graph
+    domain_pairs = access.domain_prefix_pairs()
+    ontology_index = build_ontology_index(ctx.graph)
+    ontology_chapter = profile.format_ontology_chapter(ctx.graph, suffix=ontology_index)
 
-    facts_instruction_str = facts_instruction_template.format(
-        ontology_namespace=state.ontology_snapshot.namespace,
-        ontology_prefix=state.ontology_snapshot.prefix,
+    facts_instruction_str = profile.facts_operational_guidelines(
         facts_namespace=DEFAULT_IRI,
+        domain_ontologies_clause=format_ontologies_clause(domain_pairs),
     )
 
     text_chapter = text_template.format(text=state.content_unit.text)
@@ -158,7 +162,9 @@ def _handle_rendering_error(
 
 
 async def render_facts_fresh(
-    state: UnitFactsState, tools: AtomicToolBox
+    state: UnitFactsState,
+    tools: AtomicToolBox,
+    supplemental_ontologies: Sequence[Ontology] | None = None,
 ) -> UnitFactsState:
     """Render fresh facts from the current chunk into Turtle format.
 
@@ -170,16 +176,23 @@ async def render_facts_fresh(
         UnitFactsState: Updated state with rendered facts.
     """
     logger.info("Rendering fresh facts")
+    state.quarantined_literal_triples = []
     llm_tool = await tools.get_llm_tool(state.budget_tracker)
+    profile = get_graph_format_profile(state.llm_graph_format)
     parser = PydanticOutputParser(pydantic_object=FactsRenderReport)
 
-    known_prefixes = _extract_known_prefixes(state)
+    access = ontology_access_for_unit_facts(state)
 
-    prompt_data = _prepare_prompt_data(state)
+    known_prefixes = build_llm_prefix_map(
+        access.ontology_for_prefixes(),
+        supplemental_ontologies or (),
+    )
+
+    prompt_data = _prepare_prompt_data(state, access, profile)
     prompt_data_fresh = {
         "preamble": preamble,
         "improvement_instruction": "",
-        "output_instruction": output_instruction_empty,
+        "output_instruction": profile.render_fresh_output_instruction(target="facts"),
     }
     prompt_data.update(prompt_data_fresh)
 
@@ -194,19 +207,26 @@ async def render_facts_fresh(
             prompt=prompt,
             parser=parser,
             prompt_kwargs={
-                "format_instructions": parser.get_format_instructions(),
+                "format_instructions": profile.format_instructions(FactsRenderReport),
                 **prompt_data,
             },
+            llm_graph_format=state.llm_graph_format,
         )
         state.set_external_evidence_request(
             WorkflowNode.TEXT_TO_FACTS, render_report.external_evidence_request
         )
-        facts_report = render_report.facts_report
-        facts_report.semantic_graph.sanitize_prefixes_namespaces()
-        state.content_unit.graph = facts_report.semantic_graph
+        render_report.semantic_graph.sanitize_prefixes_namespaces()
+        clean_graph, rejected = finalize_llm_graph(render_report.semantic_graph)
+        state.content_unit.graph = clean_graph
+        state.quarantined_literal_triples = rejected
+        if rejected:
+            logger.warning(
+                "Fresh facts quarantined %d triple(s) with invalid typed literals",
+                len(rejected),
+            )
 
         # Track triples in budget tracker (fresh facts)
-        num_triples = len(facts_report.semantic_graph)
+        num_triples = len(clean_graph)
         logger.info(f"Fresh facts generated with {num_triples} triple(s).")
         state.budget_tracker.add_facts_update(num_operations=1, num_triples=num_triples)
 
@@ -222,7 +242,9 @@ async def render_facts_fresh(
 
 
 async def render_facts_update(
-    state: UnitFactsState, tools: AtomicToolBox
+    state: UnitFactsState,
+    tools: AtomicToolBox,
+    supplemental_ontologies: Sequence[Ontology] | None = None,
 ) -> UnitFactsState:
     """Render facts updates using SPARQL operations.
 
@@ -234,23 +256,27 @@ async def render_facts_update(
         UnitFactsState: Updated state with rendered facts.
     """
     logger.info("Rendering updates for facts")
+    state.quarantined_literal_triples = []
     llm_tool = await tools.get_llm_tool(state.budget_tracker)
+    profile = get_graph_format_profile(state.llm_graph_format)
     parser = PydanticOutputParser(pydantic_object=GraphUpdateRenderReport)
 
-    prompt_data = _prepare_prompt_data(state)
+    access = ontology_access_for_unit_facts(state)
+    prompt_data = _prepare_prompt_data(state, access, profile)
     prompt_data_update = {
         "preamble": preamble,
         "improvement_instruction": render_suggestions_prompt(
             state.suggestions, WorkflowNode.TEXT_TO_FACTS
         ),
-        "output_instruction": output_instruction_sparql,
-        "fact_chapter": facts_template.format(
-            facts_ttl=state.content_unit.graph.serialize(format="turtle")
-        ),
+        "output_instruction": profile.render_update_output_instruction(),
+        "fact_chapter": profile.format_facts_chapter(state.content_unit.graph),
     }
     prompt_data.update(prompt_data_update)
     prompt = _create_prompt_template()
-    known_prefixes = _extract_known_prefixes(state)
+    known_prefixes = build_llm_prefix_map(
+        access.ontology_for_prefixes(),
+        supplemental_ontologies or (),
+    )
 
     try:
         # Set known prefixes in context before parsing
@@ -261,14 +287,28 @@ async def render_facts_update(
             prompt=prompt,
             parser=parser,
             prompt_kwargs={
-                "format_instructions": parser.get_format_instructions(),
+                "format_instructions": profile.format_instructions(
+                    GraphUpdateRenderReport
+                ),
                 **prompt_data,
             },
+            llm_graph_format=state.llm_graph_format,
         )
         state.set_external_evidence_request(
             WorkflowNode.TEXT_TO_FACTS, render_report.external_evidence_request
         )
         graph_update = render_report.graph_update
+        all_rejected = []
+        for op in graph_update.triple_operations:
+            clean_graph, rejected = finalize_llm_graph(op.graph)
+            op.graph = clean_graph
+            all_rejected.extend(rejected)
+        state.quarantined_literal_triples = all_rejected
+        if all_rejected:
+            logger.warning(
+                "Facts update quarantined %d triple(s) with invalid typed literals",
+                len(all_rejected),
+            )
         state.facts_updates.append(graph_update)
         state.update_facts()
 

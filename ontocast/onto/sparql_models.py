@@ -1,18 +1,20 @@
-"""Pydantic models for SPARQL operations.
+"""Pydantic models for SPARQL graph mutations and tool SPARQL operations.
 
-This module provides Pydantic models for structured SPARQL queries
-that can be used with PydanticOutputParser for LLM integration.
+``GraphUpdate`` / ``TripleOp`` are the canonical LLM pipeline mutation abstraction
+(ordered triple patches + optional raw SPARQL strings). ``SPARQLOperationModel`` is
+used by tooling (``tool/sparql.py``, ``graph_version_manager.py``) — a separate path.
 """
 
 import logging
-from typing import Annotated, Any
+from typing import Any
 from typing import Literal as TypingLiteral
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, Field, field_validator
 from rdflib import BNode, Literal, Node, URIRef
 
 from ontocast.onto.constants import COMMON_PREFIXES
 from ontocast.onto.enum import SPARQLOperationType
+from ontocast.onto.llm_graph_payload import LLMGraphWire
 from ontocast.onto.rdfgraph import RDFGraph
 
 logger = logging.getLogger(__name__)
@@ -47,202 +49,6 @@ class SPARQLOperationModel(BaseModel):
     )
 
 
-class StructuredSPARQLQueryModel(BaseModel):
-    """Pydantic model for structured SPARQL queries.
-
-    Attributes:
-        operations: List of SPARQL operations (INSERT, UPDATE, DELETE)
-        namespaces: Dictionary mapping prefixes to URIs
-    """
-
-    operations: list[SPARQLOperationModel] = Field(
-        default_factory=list, description="List of SPARQL operations to execute"
-    )
-    namespaces: dict[str, str] = Field(
-        default_factory=dict,
-        description="Dictionary mapping namespace prefixes to URIs",
-    )
-
-    def get_summary(self) -> str:
-        """Get a summary of the structured query."""
-        add_count = len(
-            [
-                op
-                for op in self.operations
-                if op.operation_type == SPARQLOperationType.INSERT
-            ]
-        )
-        update_count = len(
-            [
-                op
-                for op in self.operations
-                if op.operation_type == SPARQLOperationType.UPDATE
-            ]
-        )
-        remove_count = len(
-            [
-                op
-                for op in self.operations
-                if op.operation_type == SPARQLOperationType.DELETE
-            ]
-        )
-
-        return (
-            f"Structured SPARQL Query: "
-            f"{add_count} ADD operations, "
-            f"{update_count} UPDATE operations, "
-            f"{remove_count} REMOVE operations"
-        )
-
-    def get_all_operations(self) -> list[SPARQLOperationModel]:
-        """Get all operations in execution order (INSERT, UPDATE, DELETE)."""
-        # Sort operations by type: INSERT first, then UPDATE, then DELETE
-        type_order = {
-            SPARQLOperationType.INSERT: 0,
-            SPARQLOperationType.UPDATE: 1,
-            SPARQLOperationType.DELETE: 2,
-        }
-        return sorted(self.operations, key=lambda op: type_order[op.operation_type])
-
-    def get_add_operations(self) -> list[SPARQLOperationModel]:
-        """Get all INSERT operations."""
-        return [
-            op
-            for op in self.operations
-            if op.operation_type == SPARQLOperationType.INSERT
-        ]
-
-    def get_update_operations(self) -> list[SPARQLOperationModel]:
-        """Get all UPDATE operations."""
-        return [
-            op
-            for op in self.operations
-            if op.operation_type == SPARQLOperationType.UPDATE
-        ]
-
-    def get_remove_operations(self) -> list[SPARQLOperationModel]:
-        """Get all DELETE operations."""
-        return [
-            op
-            for op in self.operations
-            if op.operation_type == SPARQLOperationType.DELETE
-        ]
-
-
-class OntologyUpdateReport(BaseModel):
-    """Report from ontology update process using structured SPARQL.
-
-    Attributes:
-        update_success: True if the ontology update was performed successfully
-        structured_query: The structured SPARQL query used for the update
-        add_count: Number of ADD operations
-        update_count: Number of UPDATE operations
-        remove_count: Number of REMOVE operations
-        critique: Optional critique of the update process
-    """
-
-    update_success: bool = Field(
-        description="True if the ontology update was performed successfully, False otherwise"
-    )
-    structured_query: StructuredSPARQLQueryModel = Field(
-        description="The structured SPARQL query used for the update"
-    )
-    add_count: int = Field(
-        description="Number of ADD operations in the structured query"
-    )
-    update_count: int = Field(
-        description="Number of UPDATE operations in the structured query"
-    )
-    remove_count: int = Field(
-        description="Number of REMOVE operations in the structured query"
-    )
-    critique: str | None = Field(
-        None, description="Optional critique or explanation of the update process"
-    )
-
-
-class FactsUpdateReport(BaseModel):
-    """Report from facts update process using structured SPARQL.
-
-    Attributes:
-        update_success: True if the facts update was performed successfully
-        structured_query: The structured SPARQL query used for the update
-        add_count: Number of ADD operations
-        update_count: Number of UPDATE operations
-        remove_count: Number of REMOVE operations
-        critique: Optional critique of the update process
-    """
-
-    update_success: bool = Field(
-        description="True if the facts update was performed successfully, False otherwise"
-    )
-    structured_query: StructuredSPARQLQueryModel = Field(
-        description="The structured SPARQL query used for the update"
-    )
-    add_count: int = Field(
-        description="Number of ADD operations in the structured query"
-    )
-    update_count: int = Field(
-        description="Number of UPDATE operations in the structured query"
-    )
-    remove_count: int = Field(
-        description="Number of REMOVE operations in the structured query"
-    )
-    critique: str | None = Field(
-        None, description="Optional critique or explanation of the update process"
-    )
-
-
-class FreshOntologyReport(BaseModel):
-    """Report from fresh ontology generation process.
-
-    Attributes:
-        generation_success: True if the ontology was generated successfully
-        ontology_graph: The generated ontology as an RDFGraph
-        ontology_score: Score 0-100 for ontology quality
-        critique: Optional critique of the ontology generation
-    """
-
-    generation_success: bool = Field(
-        description="True if the ontology was generated successfully, False otherwise"
-    )
-    ontology_graph: RDFGraph = Field(
-        default_factory=RDFGraph,
-        description="The generated ontology as an RDFGraph in Turtle format",
-    )
-    ontology_score: float | None = Field(
-        None, description="Score 0-100 for ontology quality and completeness"
-    )
-    critique: str | None = Field(
-        None, description="Optional critique or explanation of the ontology generation"
-    )
-
-
-class FreshFactsReport(BaseModel):
-    """Report from fresh facts generation process.
-
-    Attributes:
-        generation_success: True if the facts were generated successfully
-        facts_graph: The generated facts as an RDFGraph
-        facts_score: Score 0-100 for facts quality
-        critique: Optional critique of the facts generation
-    """
-
-    generation_success: bool = Field(
-        description="True if the facts were generated successfully, False otherwise"
-    )
-    facts_graph: RDFGraph = Field(
-        default_factory=RDFGraph,
-        description="The generated facts as an RDFGraph in Turtle format",
-    )
-    facts_score: float | None = Field(
-        None, description="Score 0-100 for facts quality and completeness"
-    )
-    critique: str | None = Field(
-        None, description="Optional critique or explanation of the facts generation"
-    )
-
-
 class TripleOp(BaseModel):
     """Operation to modify triples in the RDF graph.
 
@@ -253,16 +59,20 @@ class TripleOp(BaseModel):
     type: TypingLiteral["insert", "delete"] = Field(
         description="Type of operation: 'insert' to add triples, 'delete' to remove triples"
     )
-    graph: Annotated[
-        RDFGraph,
-        BeforeValidator(
-            lambda v: RDFGraph._from_turtle_str(v) if isinstance(v, str) else v
-        ),
-    ] = Field(
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def normalize_op_type(cls, v: object) -> str:
+        if isinstance(v, str) and v.lower() == "update":
+            return "insert"
+        return v  # type: ignore[return-value]
+
+    graph: LLMGraphWire = Field(
         default_factory=RDFGraph,
-        description="RDF graph containing triples to insert or delete. "
-        "Must be provided as a Turtle format string or RDFGraph instance. "
-        'Example Turtle: "@prefix ex: <http://example.org/> . ex:John a ex:Person ; rdfs:label "John Doe" ."',
+        description=(
+            "RDF graph containing triples to insert or delete. "
+            "Encoding is defined by deployment llm_graph_format and OUTPUT INSTRUCTION."
+        ),
     )
     prefixes: dict[str, str] = Field(
         default_factory=dict,
@@ -301,8 +111,8 @@ class GraphUpdate(BaseModel):
     triple_operations: list[TripleOp] = Field(
         default_factory=list,
         description="List of graph update operations in execution order. "
-        "Each operation should be a TripleOp (for insert/delete) with RDFGraph containing triples in Turtle format."
-        "Example: [TripleOp(type='insert', graph='@prefix ex: <http://example.org/> . ex:John a ex:Person .', prefixes={'ex': 'http://example.org/'})]",
+        "Each operation should be a TripleOp (insert/delete) with graph encoding "
+        "per deployment llm_graph_format and OUTPUT INSTRUCTION.",
     )
 
     sparql_operations: list[GenericSparqlQuery] = Field(
@@ -367,10 +177,7 @@ class GraphUpdate(BaseModel):
             - total_operations: Number of operations
             - total_triples: Total number of triples across all TripleOp operations
         """
-        total_triples = 0
-        for op in self.triple_operations:
-            if isinstance(op, TripleOp):
-                total_triples += len(op.graph)
+        total_triples = sum(len(op.graph) for op in self.triple_operations)
         return (len(self.triple_operations), total_triples)
 
     def extract_insert_graph(self) -> RDFGraph:
@@ -384,7 +191,7 @@ class GraphUpdate(BaseModel):
         """
         result = RDFGraph()
         for op in self.triple_operations:
-            if isinstance(op, TripleOp) and op.type == "insert" and len(op.graph) > 0:
+            if op.type == "insert" and len(op.graph) > 0:
                 for triple in op.graph:
                     result.add(triple)
                 for prefix, uri in op.graph.namespaces():
@@ -401,47 +208,45 @@ class GraphUpdate(BaseModel):
             String representation of all operations showing what will be added, removed, and modified.
             Returns empty string if no operations to perform.
         """
-        if not self.triple_operations:
+        if not self.triple_operations and not self.sparql_operations:
             return ""
 
         diff_parts = []
         operation_count = 0
 
         for i, op in enumerate(self.triple_operations, 1):
-            if isinstance(op, TripleOp):
-                if len(op.graph) > 0:
-                    op_type = op.type.upper()
-                    diff_parts.append(f"{i}. {op_type} {len(op.graph)} triple(s):")
+            if len(op.graph) > 0:
+                op_type = op.type.upper()
+                diff_parts.append(f"{i}. {op_type} {len(op.graph)} triple(s):")
 
-                    # Show prefixes from graph and explicit prefixes
-                    graph_prefixes = {
-                        prefix: str(uri)
-                        for prefix, uri in op.graph.namespaces()
-                        if prefix
-                    }
-                    all_prefixes = {**graph_prefixes, **op.prefixes}
-                    if all_prefixes:
-                        prefix_list = ", ".join(
-                            [f"{k}: {v}" for k, v in all_prefixes.items()]
-                        )
-                        diff_parts.append(f"   Prefixes: {prefix_list}")
+                # Show prefixes from graph and explicit prefixes
+                graph_prefixes = {
+                    prefix: str(uri) for prefix, uri in op.graph.namespaces() if prefix
+                }
+                all_prefixes = {**graph_prefixes, **op.prefixes}
+                if all_prefixes:
+                    prefix_list = ", ".join(
+                        [f"{k}: {v}" for k, v in all_prefixes.items()]
+                    )
+                    diff_parts.append(f"   Prefixes: {prefix_list}")
 
-                    for subject, predicate, obj in op.graph:
-                        symbol = "+" if op.type == "insert" else "-"
-                        diff_parts.append(
-                            f"   {symbol} {self._serialize_rdf_term(subject)} {self._serialize_rdf_term(predicate)} {self._serialize_rdf_term(obj)}"
-                        )
-                    operation_count += 1
+                for subject, predicate, obj in op.graph:
+                    symbol = "+" if op.type == "insert" else "-"
+                    diff_parts.append(
+                        f"   {symbol} {self._serialize_rdf_term(subject)} {self._serialize_rdf_term(predicate)} {self._serialize_rdf_term(obj)}"
+                    )
+                operation_count += 1
 
-            elif isinstance(op, GenericSparqlQuery):
-                if op.query.strip():
-                    # Truncate long queries for readability
-                    query_preview = op.query.strip()
-                    if len(query_preview) > 100:
-                        query_preview = query_preview[:97] + "..."
-                    diff_parts.append(f"{i}. CUSTOM SPARQL QUERY:")
-                    diff_parts.append(f"   {query_preview}")
-                    operation_count += 1
+        base_index = len(self.triple_operations)
+        for j, op in enumerate(self.sparql_operations, 1):
+            if op.query.strip():
+                i = base_index + j
+                query_preview = op.query.strip()
+                if len(query_preview) > 100:
+                    query_preview = query_preview[:97] + "..."
+                diff_parts.append(f"{i}. CUSTOM SPARQL QUERY:")
+                diff_parts.append(f"   {query_preview}")
+                operation_count += 1
 
         if operation_count == 0:
             return ""

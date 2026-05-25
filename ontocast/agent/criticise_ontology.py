@@ -11,14 +11,18 @@ from langchain_core.prompts import PromptTemplate
 from ontocast.agent.common import call_llm_with_retry
 from ontocast.onto.enum import FailureStage, Status, WorkflowNode
 from ontocast.onto.model import OntologyCritiqueReport, Suggestions
+from ontocast.onto.ontology_access import ontology_access_for_unit_ontology
 from ontocast.onto.unit_states import UnitOntologyState
-from ontocast.prompt.common import ontology_template, text_template
-from ontocast.prompt.common import system_preamble_ontology as system_preamble
+from ontocast.prompt.common import (
+    system_preamble_ontology as system_preamble,
+)
+from ontocast.prompt.common import text_template
 from ontocast.prompt.criticise_ontology import (
     intro_instruction,
     ontology_criteria,
     template_prompt,
 )
+from ontocast.prompt.graph_format import get_graph_format_profile
 from ontocast.tool import LLMTool
 from ontocast.tool.atomic import AtomicToolBox
 
@@ -50,20 +54,18 @@ async def criticise_ontology(
         state.status = Status.FAILED
         return state
 
-    current = state.current_ontology or state.ontology_snapshot
+    access = ontology_access_for_unit_ontology(state)
+    current = access.effective_ontology_for_prompt()
     if current.is_null():
         raise ValueError(
             f"Null ontology cannot be criticised: {current.iri} is not a valid ontology"
         )
 
+    profile = get_graph_format_profile(state.llm_graph_format)
     parser = PydanticOutputParser(pydantic_object=OntologyCritiqueReport)
     llm_tool: LLMTool = await tools.get_llm_tool(state.budget_tracker)
 
-    ontology_ttl = current.graph.serialize(format="turtle")
-
-    ontology_chapter = ontology_template.format(
-        ontology_ttl=ontology_ttl,
-    )
+    ontology_chapter = profile.format_ontology_chapter(current.graph)
 
     text_chapter = text_template.format(text=state.content_unit.text)
 
@@ -82,9 +84,12 @@ async def criticise_ontology(
             "ontology_chapter",
             "text_chapter",
             "external_evidence",
+            "graph_format_instruction",
             "format_instructions",
         ],
     )
+
+    graph_format_instruction = profile.critique_graph_instruction()
 
     try:
         critique: OntologyCritiqueReport = await call_llm_with_retry(
@@ -99,8 +104,12 @@ async def criticise_ontology(
                 "user_instruction": user_instruction,
                 "ontology_chapter": ontology_chapter,
                 "external_evidence": external_evidence,
-                "format_instructions": parser.get_format_instructions(),
+                "graph_format_instruction": graph_format_instruction,
+                "format_instructions": profile.format_instructions(
+                    OntologyCritiqueReport
+                ),
             },
+            llm_graph_format=state.llm_graph_format,
         )
         state.set_external_evidence_request(
             WorkflowNode.CRITICISE_ONTOLOGY, critique.external_evidence_request

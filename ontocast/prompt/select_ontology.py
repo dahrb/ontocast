@@ -1,17 +1,16 @@
 template_prompt = """
-You are a helpful assistant that decides which ontology to use for a given document.
-You are given a numbered list of ontologies and a document excerpt.
-You need to select which ontology can be used for the document to create a semantic graph.
-
-Select from the following options:
-
-0. No suitable ontology available
+You are a helpful assistant that decides which catalog ontology to use for a text segment.
+You are given a numbered list of ontologies and an excerpt. Choose one ontology, or
+indicate that none apply (use answer index {none_index} for no suitable ontology;
+use indices 1..{num_ontologies} for a listed ontology).
 
 {ontologies_list}
 
-
-Here is an excerpt from the document:
+Here is the text excerpt:
 {excerpt}
+
+Additional user instruction for ontology selection:
+{ontology_selection_user_instruction}
 
 {format_instructions}
 """

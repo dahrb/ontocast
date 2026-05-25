@@ -8,8 +8,10 @@ workflow.
 Available prompts:
 - render_ontology: Generate ontology triples from text
 - render_facts: Extract facts from text using ontologies
-- select_ontology: Choose appropriate ontologies for text
 - criticise_ontology: Evaluate and critique ontology quality
 - criticise_facts: Validate and critique extracted facts
 - common: Shared prompt templates and components
+- graph_format: GraphFormatProfile (prompt + format instructions for llm_graph_format)
+- llm_json_schema: Format-bound JSON Schema for canonical report models
+- facts_guidelines: Format-specific facts operational guidelines
 """
