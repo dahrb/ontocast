@@ -14,7 +14,7 @@ from rdflib import URIRef
 from ontocast.onto.constants import DEFAULT_IRI
 from ontocast.onto.iri_policy import normalize_namespace_iri
 from ontocast.onto.rdfgraph import RDFGraph
-from ontocast.util import render_text_hash
+from ontocast.util.hash import render_text_hash
 
 
 class OutputType(StrEnum):
@@ -40,6 +40,22 @@ class SourceUnit(BaseModel):
     doc_iri: URIRef = Field(description="IRI of parent doc")
     type: OutputType = Field(
         default=OutputType.FACTS, description="Type of content unit"
+    )
+    section_label: str | None = Field(
+        default=None,
+        description="Section label assigned during chunk prepare (e.g. results, methods)",
+    )
+    headings: list[str] | None = Field(
+        default=None,
+        description="Docling heading breadcrumb for this chunk (tagging hint).",
+    )
+    doc_item_refs: list[str] = Field(
+        default_factory=list,
+        description="Docling doc_item self_refs covered by this chunk (tagging hint).",
+    )
+    summary: str | None = Field(
+        default=None,
+        description="LLM-compressed summary of this chunk used for extraction prompts",
     )
     _hid: str = PrivateAttr(default="")
 
@@ -88,6 +104,13 @@ class SourceUnit(BaseModel):
 
     def __len__(self):
         return len(self.text)
+
+    @property
+    def extraction_text(self) -> str:
+        """Text fed to extraction and critique LLM prompts."""
+        if self.summary:
+            return self.summary
+        return self.text
 
 
 class ContentUnit(SourceUnit):

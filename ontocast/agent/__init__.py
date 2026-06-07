@@ -13,10 +13,12 @@ from .criticise_ontology import criticise_ontology
 from .render_facts import render_facts, render_facts_fresh
 from .render_ontology import render_ontology, render_ontology_fresh
 from .serialize import serialize
+from .summarize_chunks import summarize_chunk
 
 __all__ = [
     "chunk_text",
     "convert_document",
+    "summarize_chunk",
     "criticise_facts",
     "criticise_ontology",
     "render_facts",

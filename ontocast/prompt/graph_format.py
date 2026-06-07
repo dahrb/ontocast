@@ -18,7 +18,12 @@ from ontocast.prompt.llm_json_schema import format_instructions_for_model
 
 T = TypeVar("T", bound=BaseModel)
 
-# --- Output instructions (moved from common.py; single-format per profile) ---
+# --- Output instructions (single-format per profile; graph-update = base + suffix) ---
+
+# Fresh render: one block per deployment format (Turtle ontology/facts, or JSON-LD).
+# Graph update: shared base (_OUTPUT_INSTRUCTION_GRAPH_UPDATE_BASE) plus a format suffix
+# (_OUTPUT_INSTRUCTION_GRAPH_UPDATE_TURTLE_GRAPH or _JSONLD_GRAPH) appended by
+# GraphFormatProfile.render_update_output_instruction().
 
 _OUTPUT_INSTRUCTION_ONTOLOGY_TTL = """\n\n
 # OUTPUT INSTRUCTION
@@ -53,24 +58,31 @@ Provide each RDF graph field as a compact JSON-LD **object** (not a string) with
 8. Never use Turtle syntax (no ^^, no @prefix) inside JSON values.
 """
 
-_OUTPUT_INSTRUCTION_SPARQL_BASE = """\n\n
+_OUTPUT_INSTRUCTION_GRAPH_UPDATE_BASE = """\n\n
 # OUTPUT INSTRUCTION
 
-Generate SPARQL operations that modify the existing graph, not replace it entirely.
-Follow the Pydantic schema definitions exactly - they fully specify the output structure.
+Generate structured graph patch operations that modify the existing graph incrementally.
+Do not replace the entire graph. Do not emit raw UPDATE query syntax or query-language keywords.
 
-`sparql_operations` is for complex custom queries only. All standard add/remove operations
-MUST use `triple_operations` with type `insert` or `delete`.
+Follow the Pydantic schema exactly. Use `triple_operations` only: each entry has `type`
+(`insert` or `delete`) and `graph` (plain triples for that operation, encoded per the
+graph-format instructions below).
+
+IMPORTANT: The `type` field (`insert` or `delete`) signals which triples to add or remove.
+The `graph` field ALWAYS contains plain triples — never wrap them in DELETE DATA { } or
+INSERT DATA { } blocks. That is update-query syntax and will fail validation.
 """
 
-_OUTPUT_INSTRUCTION_SPARQL_TURTLE_GRAPH = """
+_OUTPUT_INSTRUCTION_GRAPH_UPDATE_TURTLE_GRAPH = """
 
 For each `TripleOp.graph` field, provide a **single Turtle string** with:
 - `@prefix` declarations for every namespace used in that operation
 - Only the triples to insert or delete (no comments)
+- NEVER use UPDATE query syntax (`INSERT DATA`, `DELETE DATA`, bare `PREFIX` lines) in this field
+- Only `@prefix` lines and triples — parseable as plain Turtle, not as an UPDATE query
 """
 
-_OUTPUT_INSTRUCTION_SPARQL_JSONLD_GRAPH = """
+_OUTPUT_INSTRUCTION_GRAPH_UPDATE_JSONLD_GRAPH = """
 
 For each `TripleOp.graph` field, provide a compact JSON-LD **object** (not a string) with:
 
@@ -83,6 +95,7 @@ For each `TripleOp.graph` field, provide a compact JSON-LD **object** (not a str
 4. Typed literals MUST use the value/type form: {"@value": "...", "@type": "xsd:date"}.
    Language-tagged literals use {"@value": "...", "@language": "en"}.
 5. No comments, no trailing prose - output strictly valid JSON.
+6. NEVER use UPDATE query syntax or Turtle ^^/@prefix inside JSON values.
 """
 
 _OUTPUT_INSTRUCTION_CRITIQUE_TURTLE = """\n\n
@@ -142,10 +155,10 @@ class GraphFormatProfile:
         return _OUTPUT_INSTRUCTION_FACTS_TTL
 
     def render_update_output_instruction(self) -> str:
-        base = _OUTPUT_INSTRUCTION_SPARQL_BASE
+        base = _OUTPUT_INSTRUCTION_GRAPH_UPDATE_BASE
         if self.format == LLMGraphFormat.JSONLD:
-            return base + _OUTPUT_INSTRUCTION_SPARQL_JSONLD_GRAPH
-        return base + _OUTPUT_INSTRUCTION_SPARQL_TURTLE_GRAPH
+            return base + _OUTPUT_INSTRUCTION_GRAPH_UPDATE_JSONLD_GRAPH
+        return base + _OUTPUT_INSTRUCTION_GRAPH_UPDATE_TURTLE_GRAPH
 
     def critique_graph_instruction(self) -> str:
         if self.format == LLMGraphFormat.JSONLD:
@@ -153,16 +166,30 @@ class GraphFormatProfile:
         return _OUTPUT_INSTRUCTION_CRITIQUE_TURTLE
 
     def facts_operational_guidelines(
-        self, *, facts_namespace: str, domain_ontologies_clause: str
+        self,
+        *,
+        facts_namespace: str,
+        domain_ontologies_clause: str,
+        search_guidelines: str = "",
     ) -> str:
         return format_facts_operational_guidelines(
             facts_namespace=facts_namespace,
             domain_ontologies_clause=domain_ontologies_clause,
             jsonld=self.format == LLMGraphFormat.JSONLD,
+            search_guidelines=search_guidelines,
         )
 
-    def format_instructions(self, report_cls: type[BaseModel]) -> str:
-        return format_instructions_for_model(report_cls, self.format)
+    def format_instructions(
+        self,
+        report_cls: type[BaseModel],
+        *,
+        web_search_enabled: bool = True,
+    ) -> str:
+        return format_instructions_for_model(
+            report_cls,
+            self.format,
+            web_search_enabled=web_search_enabled,
+        )
 
     def parse_report(self, report_cls: type[T], text: str) -> T:
         token = llm_graph_format_ctx.set(self.format)
@@ -215,10 +242,10 @@ output_instruction_empty = _PROFILES[
 output_instruction_jsonld = _PROFILES[
     LLMGraphFormat.JSONLD
 ].render_fresh_output_instruction()
-output_instruction_sparql = _PROFILES[
+output_instruction_graph_update = _PROFILES[
     LLMGraphFormat.TURTLE
 ].render_update_output_instruction()
-output_instruction_sparql_jsonld = _PROFILES[
+output_instruction_graph_update_jsonld = _PROFILES[
     LLMGraphFormat.JSONLD
 ].render_update_output_instruction()
 output_instruction_critique_turtle = _PROFILES[

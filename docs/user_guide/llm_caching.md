@@ -11,7 +11,37 @@ The LLM caching system automatically caches responses from language model provid
 - **Performance**: Cached responses return instantly
 - **Cost Reduction**: Avoids duplicate API calls
 - **Offline Testing**: Tests can run without API access
-- **Transparency**: No configuration required - works automatically
+- **Transparency**: Enabled by default; optional env vars control read-only mode, concurrency, and observability
+
+---
+
+## Configuration
+
+| Setting | Env | Default | Description |
+|---------|-----|---------|-------------|
+| `cache_enabled` | `LLM_CACHE_ENABLED` | `true` | Read/write disk cache |
+| `cache_read_only` | `LLM_CACHE_READ_ONLY` | `false` | Use cache without writing new entries |
+| `llm_max_inflight` | `LLM_MAX_INFLIGHT` | `16` | Max concurrent provider requests (all documents) |
+
+Server-wide process concurrency (separate from LLM in-flight limit):
+
+| Setting | Env | Description |
+|---------|-----|-------------|
+| `max_concurrent_processes` | `MAX_CONCURRENT_PROCESSES` | Cap simultaneous `/process` and `/process_unit` handlers |
+
+Cache statistics are exposed on `GET /info` under `llm_cache`. Processing budget summaries include `cache_hits` when responses are served from disk (see [Budget Tracking](concepts.md#budget-tracking)).
+
+### Concurrency layers
+
+Three independent knobs affect parallelism:
+
+| Layer | Setting | What it limits |
+|-------|---------|----------------|
+| Unit workers | `PARALLEL_WORKERS` | Concurrent ontology/facts loops per document |
+| Provider calls | `LLM_MAX_INFLIGHT` | Concurrent LLM HTTP requests **across all units and documents** |
+| HTTP handlers | `MAX_CONCURRENT_PROCESSES` | Simultaneous `/process` and `/process_unit` pipelines |
+
+`LLM_MAX_INFLIGHT` prevents rate-limit storms when `PARALLEL_WORKERS` is high. `MAX_CONCURRENT_PROCESSES` is optional; when set, extra clients **wait** for a handler slot rather than starting unbounded full pipelines.
 
 ---
 
@@ -63,15 +93,7 @@ response1 = llm_tool("What is the capital of France?")
 response2 = llm_tool("What is the capital of France?")
 ```
 
-### Cache Key Generation
-
-Cache keys are generated based on:
-- LLM provider and model
-- Prompt text
-- Temperature and other parameters
-- API endpoint URL
-
-This ensures that different configurations or parameters result in separate cache entries.
+Cache keys hash **normalized prompt text** (LangChain prompt values use `to_string()`) together with provider, model, temperature, base URL, and schema-specific fields (for structured `extract` calls). Different configurations never share an entry.
 
 ---
 
@@ -209,11 +231,13 @@ from ontocast.tool.llm import LLMTool
 
 # Check cache directory
 llm_tool = LLMTool.create(config=llm_config)
-print(f"Cache directory: {llm_tool.cache.tool_cache_dir}")
+cache_dir = llm_tool.cache.shared_cacher.cache_dir / "llm"
+print(f"Cache directory: {cache_dir}")
 
 # List cached files
-cache_files = list(llm_tool.cache.tool_cache_dir.glob("**/*.json"))
+cache_files = list(cache_dir.glob("*.json"))
 print(f"Cached responses: {len(cache_files)}")
+print(f"Stats: {llm_tool.get_cache_stats()}")
 ```
 
 ### Clear Cache
@@ -254,11 +278,13 @@ class CustomLLMTool(LLMTool):
 ```python
 from ontocast.tool.llm import LLMTool
 
-# Get cache statistics
 llm_tool = LLMTool.create(config=llm_config)
-stats = llm_tool.cache.get_cache_stats()
+stats = llm_tool.get_cache_stats()
+# {"cache_hits": 12, "cache_misses": 3, "disk": {"total_files": 42, ...}}
 print(f"Cache stats: {stats}")
 ```
+
+On a running server, the same counters are available from `GET /info` (`llm_cache` field).
 
 ---
 
@@ -410,14 +436,30 @@ converted = tools.converter(document_file)
 chunks = tools.chunker(text)
 ```
 
-### Cache Key Generation
+### OpenAI Batch API (offline benchmarks)
 
-Cache keys are generated based on:
-- **Content hash**: SHA256 hash of the input content
-- **Configuration**: All relevant parameters that affect the output
-- **Tool-specific parameters**: Model names, chunking modes, etc.
+For large first-pass benchmark runs, you can pre-fill the disk cache using the provider Batch API (~50% lower cost, hours of latency). See `ontocast.tool.llm_batch`:
 
-This ensures that different configurations produce different cache entries, even for the same input content.
+```python
+from pathlib import Path
+from ontocast.config import LLMConfig
+from ontocast.tool.cache import Cacher
+from ontocast.tool.llm_batch import (
+    import_openai_batch_output_jsonl,
+    write_openai_chat_batch_jsonl,
+)
+
+# 1. Build requests (custom_id -> prompt text mapping for import)
+write_openai_chat_batch_jsonl(requests, Path("batch_input.jsonl"))
+# 2. Submit batch_input.jsonl via OpenAI dashboard or API; download output JSONL
+# 3. Import into the same cache directory the server will use
+import_openai_batch_output_jsonl(
+    Path("batch_output.jsonl"),
+    shared_cache=Cacher(cache_dir="/path/to/cache"),
+    llm_config=LLMConfig(),
+    custom_id_to_cache_key={"req-1": "full prompt text used as cache key"},
+)
+```
 
 ### Best Practices
 

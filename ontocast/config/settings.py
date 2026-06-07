@@ -140,6 +140,14 @@ class EmbeddingProvider(StrEnum):
     OLLAMA = "ollama"
 
 
+class CrossQueryMergeMode(StrEnum):
+    """How per-query fused hits are merged across proposition windows."""
+
+    HYBRID = "hybrid"
+    MAX_SCORE = "max_score"
+    RRF = "rrf"
+
+
 class QdrantDedupMode(StrEnum):
     """How Qdrant point identity is derived during upsert."""
 
@@ -161,6 +169,52 @@ class LLMConfig(BaseSettings):
         default=None, description="LLM base URL (for ollama, etc.)"
     )
     api_key: str | None = Field(default=None, description="API key for LLM provider")
+    cache_enabled: bool = Field(
+        default=True,
+        description="When true, read and write LLM response disk cache entries.",
+    )
+    cache_read_only: bool = Field(
+        default=False,
+        description="When true, use cached responses but do not write new entries.",
+    )
+    llm_max_inflight: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "Maximum concurrent provider LLM requests shared across all documents."
+        ),
+    )
+    think: bool | None = Field(
+        default=None,
+        description=(
+            "Controls thinking/reasoning mode for Ollama thinking models "
+            "(e.g. qwen3, deepseek-r1). "
+            "False disables thinking and ensures a non-empty content response. "
+            "True enables thinking and captures it separately in reasoning_content. "
+            "None uses the model's default behaviour (thinking tags may appear "
+            "inline in content, or the response may be empty if all tokens are "
+            "consumed during reasoning)."
+        ),
+    )
+    num_predict: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens to generate (Ollama only). "
+            "None uses Ollama's default (unlimited). "
+            "Increase this when using thinking models to ensure enough tokens "
+            "remain for the actual response after the reasoning phase."
+        ),
+    )
+    num_ctx: int | None = Field(
+        default=None,
+        description=(
+            "Context window size in tokens (Ollama only). "
+            "Controls the total KV-cache window: prompt tokens + output tokens must "
+            "fit within this budget. Ollama's default is model-dependent (often "
+            "2048–4096). For large prompts set this to 16384 or higher. "
+            "Directly affects VRAM usage on the inference server."
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="LLM_",
@@ -212,6 +266,13 @@ class ChunkConfig(BaseSettings):
     )
     min_size: int = Field(default=3000, description="Minimum chunk size in characters")
     max_size: int = Field(default=12000, description="Maximum chunk size in characters")
+    section_tag_min_chars: int = Field(
+        default=80,
+        description=(
+            "Min stripped length for LLM section tagging; smaller segments merge "
+            "into neighbors before tagging"
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="CHUNK_",
@@ -280,6 +341,14 @@ class ServerConfig(BaseSettings):
     enable_ontology_consolidation: bool = Field(
         default=False,
         description="Run optional ontology consolidation pass after normalization",
+    )
+    max_concurrent_processes: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "When set, limit concurrent /process and /process_unit handlers; "
+            "additional requests receive HTTP 503 until a slot is free."
+        ),
     )
 
     model_config = SettingsConfigDict(
@@ -597,7 +666,7 @@ class PatchRetrievalConfig(BaseSettings):
         ),
     )
     merged_score_ratio: float = Field(
-        default=0.0,
+        default=0.45,
         ge=0.0,
         le=1.0,
         description=(
@@ -605,8 +674,37 @@ class PatchRetrievalConfig(BaseSettings):
             "fraction of the merged top score. 0 disables."
         ),
     )
+    cross_query_merge_mode: CrossQueryMergeMode = Field(
+        default=CrossQueryMergeMode.HYBRID,
+        description=(
+            "Cross-window merge: hybrid (max-score tier-1 + per-ontology tier-2), "
+            "max_score (entity best per window), or rrf (legacy reciprocal rank sum)."
+        ),
+    )
+    max_atoms_tier1: int = Field(
+        default=12,
+        ge=0,
+        description=(
+            "Hybrid merge: global cap on strong tier-1 seeds (max score per entity IRI). "
+            "0 means no tier-1 cap."
+        ),
+    )
+    per_ontology_seed_quota: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Hybrid merge: additional seeds per ontology IRI in tier-2 (multi-ontology coverage)."
+        ),
+    )
+    min_entity_score: float = Field(
+        default=0.3,
+        ge=0.0,
+        description=(
+            "Hybrid merge tier-2: minimum per-entity max fused score to qualify as a seed."
+        ),
+    )
     mmr_lambda: float = Field(
-        default=0.7,
+        default=0.9,
         ge=0.0,
         le=1.0,
         description=(
@@ -615,7 +713,7 @@ class PatchRetrievalConfig(BaseSettings):
         ),
     )
     max_atoms: int = Field(
-        default=0,
+        default=25,
         ge=0,
         description="Hard cap for retained atoms after filtering / MMR (0 means unlimited).",
     )
@@ -659,7 +757,7 @@ class QdrantConfig(BaseSettings):
         ),
     )
     top_k: int = Field(
-        default=3,
+        default=10,
         ge=1,
         description=(
             "Default number of fused vector hits per query for ontology-patch retrieval "
@@ -668,12 +766,27 @@ class QdrantConfig(BaseSettings):
         ),
     )
     induced_subgraph_depth: int = Field(
-        default=1,
+        default=2,
         ge=0,
         description="Neighborhood expansion depth for induced subgraph retrieval.",
     )
+    induced_subgraph_hub_seed_count: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Induced subgraph: number of top-relevance seeds that receive full BFS hub "
+            "expansion. 0 disables hub-only BFS (all seeds expand)."
+        ),
+    )
+    induced_subgraph_ancestor_closure_depth: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Induced subgraph schema shell: max rdfs:subClassOf hops upward per class seed."
+        ),
+    )
     induced_subgraph_max_total_triples: int = Field(
-        default=300,
+        default=550,
         ge=1,
         description="Hard cap on triples returned for induced subgraph retrieval.",
     )

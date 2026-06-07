@@ -1,7 +1,9 @@
-"""Shared HTTP query/body parsing for CLI server routes."""
+"""Shared HTTP query/body parsing for API server routes."""
 
+import json
 import logging
 
+from ontocast.config.section_labels import normalise_user_section_label
 from ontocast.onto.enum import LLMGraphFormat, OntologyContextMode, RenderMode
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,66 @@ def parse_strip_provenance_param(value: str | None) -> bool:
         value,
     )
     return False
+
+
+def _normalise_section_tokens(raw_tokens: list[str]) -> list[str]:
+    result: list[str] = []
+    for token in raw_tokens:
+        normalised = normalise_user_section_label(token)
+        if normalised is None:
+            logger.warning("Unrecognised section label %r — skipping", token)
+        else:
+            result.append(normalised)
+    return result
+
+
+def parse_sections_list_param(value: str | list[str] | None) -> list[str]:
+    """Parse a section list from comma-separated text or JSON array."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_tokens = [str(item).strip() for item in value if str(item).strip()]
+        return _normalise_section_tokens(raw_tokens)
+    raw = str(value).strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("section list JSON must be an array")
+        raw_tokens = [str(item).strip() for item in parsed if str(item).strip()]
+        return _normalise_section_tokens(raw_tokens)
+    raw_tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    return _normalise_section_tokens(raw_tokens)
+
+
+def parse_document_type_hint_param(value: str | None) -> str | None:
+    """Parse optional document_type_hint; empty strings become None."""
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped or None
+
+
+def parse_section_schema_id_param(value: str | None) -> str | None:
+    """Parse optional section_schema_id; empty strings become None."""
+    if value is None:
+        return None
+    stripped = str(value).strip().lower()
+    return stripped or None
+
+
+def parse_summary_max_sentences_param(value: str | int | None, default: int) -> int:
+    """Parse optional summary_max_sentences (positive integer)."""
+    if value is None:
+        return default
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("summary_max_sentences must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError("summary_max_sentences must be a positive integer")
+    return parsed
 
 
 def parse_max_visits_param(value: str | int | None, default: int) -> int:

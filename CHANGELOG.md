@@ -8,10 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Facts precision/recall/F1** on `POST /match/evaluate` (`fact_precision`, `fact_recall`, `fact_f1` and counts): relational triples only, excluding schema predicates and triples with ontological class/concept nodes in subject or object position.
 - **Anthropic (Claude) and Google (Gemini) LLM providers** via `LLM_PROVIDER=anthropic|google`, with `ClaudeModel` and `GeminiModel` config enums.
 - **Token usage reporting** in `BudgetTracker` when providers return `usage_metadata` on LLM responses (character counts remain the universal fallback).
+- **LLM disk cache controls** on `LLMConfig`: `LLM_CACHE_ENABLED` (default on), `LLM_CACHE_READ_ONLY`, and in-memory plus on-disk stats via `LLMTool.get_cache_stats()`; `GET /info` exposes `llm_cache`.
+- **Global LLM in-flight limit** (`LLM_MAX_INFLIGHT`, default 16) — shared semaphore caps concurrent provider requests across parallel unit workers.
+- **Optional process concurrency cap** (`MAX_CONCURRENT_PROCESSES`) — limits simultaneous `/process` and `/process_unit` handlers (additional requests wait for a slot).
+- **OpenAI Batch API helpers** (`ontocast.tool.llm_batch`) to export chat batch JSONL and import completed results into the LLM disk cache for offline benchmark pre-warming.
+- **`BudgetTracker.cache_hits`** — disk-cache hits count toward character totals but not `calls_count`; included in budget summaries when non-zero.
+- **Multi-domain section label catalog** (`data/section_labels/`) — versioned YAML schemas for academic, financial, legal, clinical, manual, fiction, and general documents; `section_schema_id` and `document_type_hint` on `/process` and CLI.
+- **Structured-document preprocessing** for heading-structured text: the **Chunk** node runs prepare (segment → tag → filter → size) with section-aligned labels via document-wide regex spans and parallel LLM backfill; `target_sections` filters units before extraction.
+- **Optional chunk summarization** — `summarize_sections` and `summary_max_sentences` on `/process` and CLI (`--summarize-sections`, `--summary-max-sentences`) run a **Summarize Chunks** graph node; ontology/facts render and critic prompts use `ContentUnit.extraction_text` (summary when present, else full chunk text).
 
 ### Changed
+- **Section pipeline layout** — span detection and LLM backfill live under `ontocast.tool.chunk` (`sections.py`, `section_llm.py`, `segment.py`); section-label YAML and loader live in `ontocast.config.section_labels`; runtime settings remain `from ontocast.config import Config`; `SectionSpan` in `ontocast.onto.section_models`.
+- **Chunk prepare** — pre-tag coalescing merges undersized hybrid segments into the right neighbor (trailing tiny segments merge left); LLM section backfill skips fragments below `CHUNK_SECTION_TAG_MIN_CHARS`; academic abstract detection uses relaxed heading patterns and optional front-matter span injection.
+- **Chunk prepare** — section tagging, allowlist filtering, and size normalization run in one pipeline inside the Chunk node (removed separate Tag Sections workflow node).
+- **LLM caching path** — `complete`, `extract`, `__call__`, and `acall` share one `_invoke_cached` implementation with consistent cache keys (normalized prompt text), optional disable/read-only modes, and provider calls gated by the global in-flight semaphore.
 - **Facts extraction prompts** (`facts_guidelines.py`): clearer two-namespace contract — domain ontology is read-only schema plus optional **reference individuals**; all text-derived occurrences use `cd:` with `lowercase_snake_case` local names. New rules separate **classes** from **instances** (no PascalCase class IRIs in subject/object slots), forbid typing `cd:` entities as `rdfs:Class` / `rdf:Property`, and add a final structural validation checklist before output.
 
 ### Fixed
@@ -20,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 - User guide: facts two-namespace model (`concepts.md`), facts guidelines vs `facts_user_instruction` (`user_instructions.md`), entity alignment and evaluate semantics (`aggregation.md`, `api.md`, `workflow.md`).
+- User guide: LLM cache configuration, in-flight/process limits, batch pre-warming, and `/info` cache stats (`llm_caching.md`, `configuration.md`, `api.md`, `concepts.md`, `workflow.md`).
+- User guide: structured documents — section tagging, section-aligned chunk labels, `target_sections` / `summarize_sections` (`concepts.md`, `workflow.md`, `api.md`, `configuration.md`).
 
 ## [0.4.0] - 2026-05-26
 

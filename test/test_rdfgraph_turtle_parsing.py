@@ -64,6 +64,48 @@ def test_from_turtle_drops_invalid_date_datatype_for_non_iso_dates() -> None:
     assert triple in graph
 
 
+def test_from_turtle_preserves_xsd_datetime_literal() -> None:
+    """xsd:dateTime must not be corrupted by xsd:date literal coercion."""
+    ttl = """
+    @prefix doc: <https://growgraph.dev/doc/b9355d00de72/> .
+    @prefix prov: <http://www.w3.org/ns/prov#> .
+    @prefix schema: <https://schema.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    doc:b9355d00de72 a prov:Entity,
+            schema:text ;
+        prov:generatedAtTime "2026-06-02T15:04:28.776738+00:00"^^xsd:dateTime ;
+        schema:identifier "b9355d00de72"^^xsd:string ;
+        schema:position 0 .
+    """
+
+    graph = RDFGraph._from_turtle_str(ttl)
+
+    assert len(graph) == 5
+    generated_at = Literal(
+        "2026-06-02T15:04:28.776738+00:00",
+        datatype=URIRef("http://www.w3.org/2001/XMLSchema#dateTime"),
+    )
+    assert (
+        URIRef("https://growgraph.dev/doc/b9355d00de72/b9355d00de72"),
+        URIRef("http://www.w3.org/ns/prov#generatedAtTime"),
+        generated_at,
+    ) in graph
+
+
+def test_coerce_invalid_date_typed_literals_does_not_match_datetime() -> None:
+    turtle = 'prov:generatedAtTime "2026-06-02T15:04:28.776738+00:00"^^xsd:dateTime ;'
+    assert RDFGraph._coerce_invalid_date_typed_literals(turtle) == turtle
+
+
+def test_coerce_invalid_nquads_date_typed_literals_does_not_match_datetime() -> None:
+    nquads = (
+        '"2026-06-02T15:04:28.776738+00:00"^^'
+        "<http://www.w3.org/2001/XMLSchema#dateTime> "
+    )
+    assert RDFGraph._coerce_invalid_nquads_typed_literals(nquads) == nquads
+
+
 def test_from_turtle_removes_invisible_unicode_chars() -> None:
     ttl = """
     @prefix ex: <https://example.com/ns#> .
@@ -253,7 +295,7 @@ def test_content_unit_sanitize_coerces_plain_graph() -> None:
         index=0,
         doc_iri=URIRef("https://example.org/doc/1"),
     )
-    unit.graph = plain  # type: ignore[assignment]
+    object.__setattr__(unit, "graph", plain)
 
     unit.sanitize()
 
@@ -328,3 +370,70 @@ def test_coerce_invalid_nquads_typed_literals_strips_bad_decimal() -> None:
     coerced = RDFGraph._coerce_invalid_nquads_typed_literals(nquads)
     assert "^^<http://www.w3.org/2001/XMLSchema#decimal>" not in coerced
     assert '"10-15"' in coerced
+
+
+def test_strip_sparql_update_wrapper_extracts_delete_data_triples() -> None:
+    from ontocast.onto.rdfgraph import strip_sparql_update_wrapper
+
+    ttl = """
+    @prefix cd: <https://example.com/facts/> .
+    @prefix ex: <https://example.com/ns#> .
+
+    cd:entity_1 a ex:SomeClass ;
+        ex:label "foo" .
+
+    DELETE DATA {
+      cd:old_entity a ex:OtherClass .
+    }
+    """
+    stripped = strip_sparql_update_wrapper(ttl)
+    assert "DELETE DATA" not in stripped
+    assert "cd:entity_1 a ex:SomeClass" in stripped
+    assert "cd:old_entity a ex:OtherClass" in stripped
+
+
+def test_from_turtle_parses_mixed_turtle_and_delete_data() -> None:
+    ttl = """
+    @prefix cd: <https://example.com/facts/> .
+    @prefix ex: <https://example.com/ns#> .
+
+    cd:entity_1 a ex:SomeClass ;
+        ex:label "foo" .
+
+    DELETE DATA {
+      cd:old_entity a ex:OtherClass .
+    }
+    """
+    graph = RDFGraph._from_turtle_str(ttl)
+
+    assert len(graph) == 3
+
+
+def test_normalize_turtle_input_converts_sparql_prefix() -> None:
+    ttl = "PREFIX ex: <https://example.com/ns#>\nex:a ex:b ex:c ."
+    normalized = RDFGraph._normalize_turtle_input(ttl)
+    assert "@prefix ex: <https://example.com/ns#> ." in normalized
+    assert "PREFIX ex:" not in normalized
+
+
+def test_model_validate_uses_explicit_llm_graph_format_context() -> None:
+    from ontocast.onto.model import GraphUpdateRenderReport
+
+    payload = {
+        "graph_update": {
+            "triple_operations": [
+                {
+                    "type": "insert",
+                    "graph": {
+                        "@context": {"ex": "http://example.org/"},
+                        "@graph": [{"@id": "ex:item", "@type": "ex:Thing"}],
+                    },
+                }
+            ],
+        },
+    }
+    report = GraphUpdateRenderReport.model_validate(
+        payload,
+        context={"llm_graph_format": LLMGraphFormat.JSONLD},
+    )
+    assert len(report.graph_update.triple_operations[0].graph) >= 1

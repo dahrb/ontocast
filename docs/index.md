@@ -22,13 +22,14 @@ OntoCast extracts semantic triples from documents using an agentic, ontology-dri
 - **Parallel map/reduce pipeline** — concurrent per-unit ontology and facts loops
 - **Robust entity disambiguation** — embedding + symbolic alignment across chunks
 - **RDF 1.2 provenance** — quoted triples, provenance artifacts, optional `strip_provenance`
-- **GraphUpdate operations** — token-efficient SPARQL insert/delete instead of full graph regeneration
+- **GraphUpdate operations** — token-efficient structured insert/delete triple patches instead of full graph regeneration
 - **JSON-LD wire format** — optional `LLM_GRAPH_FORMAT=jsonld` for LLM payloads
 - **Ontology context modes** — catalog selection, vector retrieval, or fixed ontology
 - **Triple store integration** — Fuseki, Neo4j (n10s), or filesystem fallback
 - **Tenancy** — partition datasets/collections by tenant and project
 - **REST API** — document processing, ontology catalog management, graph matching
-- **Automatic LLM caching** — built-in response caching
+- **Automatic LLM caching** — disk cache with optional read-only mode, global in-flight limiting, and OpenAI Batch API pre-warming for benchmarks
+- **Structured documents** — optional section tagging, section-aligned chunk labels, section filtering, and LLM summarization before extraction
 
 ---
 
@@ -99,9 +100,9 @@ Document-level pipeline (regenerated via `uv run plot-graph`):
 
 ![Workflow diagram](assets/graph.png)
 
-Landscape variant: [graph.lr.png](assets/graph.lr.png). Per-unit render/critic loops are documented in [Workflow](user_guide/workflow.md#per-unit-atomic-loop).
+Landscape variant: [graph.lr.png](assets/graph.lr.png). Per-unit loops: [ontology_loop.png](assets/ontology_loop.png), [facts_loop.png](assets/facts_loop.png) — details in [Workflow](user_guide/workflow.md#per-unit-atomic-loop).
 
-1. Convert → chunk document
+1. Convert → chunk prepare (segment, tag, filter, size) → optional summarize chunks
 2. Parallel ontology render per unit → normalize → optional consolidate → validate
 3. Parallel facts render per unit → merge with disambiguation
 4. Serialize to triple store; return Turtle in API response

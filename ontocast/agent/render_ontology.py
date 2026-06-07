@@ -3,7 +3,7 @@
 This module provides functionality for rendering RDF triples from ontologies into
 human-readable formats, making the ontological knowledge more accessible and
 understandable.
-The agent decides between generating bare Turtle for fresh ontologies and SPARQL operations for updates.
+The agent decides between generating bare Turtle for fresh ontologies and structured graph updates for patches.
 
 """
 
@@ -34,6 +34,7 @@ from ontocast.prompt.render_ontology import (
     intro_instruction_update,
     template_prompt,
 )
+from ontocast.prompt.web_grounding import persist_search_request, search_guidelines_for
 from ontocast.tool.atomic import AtomicToolBox
 
 logger = logging.getLogger(__name__)
@@ -67,13 +68,17 @@ def _handle_ontology_render_error(
 
 
 def _prepare_ontology_common_prompt_layers(
-    state: UnitOntologyState, access: UnitOntologyAccess
+    state: UnitOntologyState,
+    access: UnitOntologyAccess,
+    *,
+    search_guidelines: str,
 ) -> tuple[str, str, str]:
     domain_pairs = access.domain_prefix_pairs()
     general_ontology_instruction_str = general_ontology_instruction.format(
-        domain_ontologies_clause=format_ontologies_clause(domain_pairs)
+        domain_ontologies_clause=format_ontologies_clause(domain_pairs),
+        search_guidelines=search_guidelines,
     )
-    text_chapter = text_template.format(text=state.content_unit.text)
+    text_chapter = text_template.format(text=state.content_unit.extraction_text)
     external_evidence = state.external_evidence_text
     if external_evidence:
         state.mark_external_evidence_used(WorkflowNode.TEXT_TO_ONTOLOGY)
@@ -85,10 +90,10 @@ async def render_ontology(
     tools: AtomicToolBox,
     supplemental_ontologies: Sequence[Ontology] | None = None,
 ) -> UnitOntologyState:
-    """Structured hybrid ontology renderer with Turtle/SPARQL decision logic.
+    """Structured hybrid ontology renderer: fresh Turtle or structured graph updates.
 
     This function decides between generating bare Turtle for fresh ontologies
-    and SPARQL operations for updates based on whether the ontology exists.
+    and structured TripleOp graph patches for updates based on whether the ontology exists.
 
     Args:
         state: The current unit ontology state
@@ -146,11 +151,20 @@ async def render_ontology_fresh(
     ontology_ttl = ""
     improvement_instruction_str = ""
     access = ontology_access_for_unit_ontology(state)
+    web_search_enabled = tools.web_grounding_enabled_for_node(
+        WorkflowNode.TEXT_TO_ONTOLOGY
+    )
     (
         general_ontology_instruction_str,
         text_chapter,
         external_evidence,
-    ) = _prepare_ontology_common_prompt_layers(state, access)
+    ) = _prepare_ontology_common_prompt_layers(
+        state,
+        access,
+        search_guidelines=search_guidelines_for(
+            WorkflowNode.TEXT_TO_ONTOLOGY, web_search_enabled
+        ),
+    )
 
     prompt = _create_ontology_render_prompt_template()
     known_prefixes = build_llm_prefix_map(
@@ -176,13 +190,17 @@ async def render_ontology_fresh(
                 "text": text_chapter,
                 "external_evidence": external_evidence,
                 "format_instructions": profile.format_instructions(
-                    OntologyRenderReport
+                    OntologyRenderReport,
+                    web_search_enabled=web_search_enabled,
                 ),
             },
             llm_graph_format=state.llm_graph_format,
         )
-        state.set_external_evidence_request(
-            WorkflowNode.TEXT_TO_ONTOLOGY, render_report.external_evidence_request
+        persist_search_request(
+            state,
+            WorkflowNode.TEXT_TO_ONTOLOGY,
+            render_report.external_evidence_request,
+            web_search_enabled,
         )
         state.current_ontology = render_report.ontology
         state.current_ontology.graph.sanitize_prefixes_namespaces()
@@ -251,11 +269,20 @@ async def render_ontology_update(
         state.suggestions, WorkflowNode.TEXT_TO_ONTOLOGY
     )
 
+    web_search_enabled = tools.web_grounding_enabled_for_node(
+        WorkflowNode.TEXT_TO_ONTOLOGY
+    )
     (
         general_ontology_instruction_str,
         text_chapter,
         external_evidence,
-    ) = _prepare_ontology_common_prompt_layers(state, access)
+    ) = _prepare_ontology_common_prompt_layers(
+        state,
+        access,
+        search_guidelines=search_guidelines_for(
+            WorkflowNode.TEXT_TO_ONTOLOGY, web_search_enabled
+        ),
+    )
 
     prompt = _create_ontology_render_prompt_template()
     known_prefixes = build_llm_prefix_map(
@@ -282,13 +309,17 @@ async def render_ontology_update(
                 "text": text_chapter,
                 "external_evidence": external_evidence,
                 "format_instructions": profile.format_instructions(
-                    GraphUpdateRenderReport
+                    GraphUpdateRenderReport,
+                    web_search_enabled=web_search_enabled,
                 ),
             },
             llm_graph_format=state.llm_graph_format,
         )
-        state.set_external_evidence_request(
-            WorkflowNode.TEXT_TO_ONTOLOGY, render_report.external_evidence_request
+        persist_search_request(
+            state,
+            WorkflowNode.TEXT_TO_ONTOLOGY,
+            render_report.external_evidence_request,
+            web_search_enabled,
         )
         graph_update = render_report.graph_update
         state.ontology_updates.append(graph_update)
@@ -309,7 +340,7 @@ async def render_ontology_update(
 
     except Exception as e:
         return _handle_ontology_render_error(
-            state, e, FailureStage.GENERATE_SPARQL_UPDATE_FOR_ONTOLOGY
+            state, e, FailureStage.GENERATE_GRAPH_UPDATE_FOR_ONTOLOGY
         )
     finally:
         # Clear the context after parsing

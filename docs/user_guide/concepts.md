@@ -16,9 +16,9 @@ OntoCast manages ontologies with automatic versioning and timestamp tracking:
 
 Token-efficient incremental graph modifications:
 
-- **Structured Operations**: LLM outputs `GraphUpdate` with `TripleOp` insert/delete ops
+- **Structured Operations**: LLM outputs `GraphUpdate` with ordered `TripleOp` insert/delete patches
 - **Wire Formats**: Turtle strings or compact JSON-LD (`LLM_GRAPH_FORMAT`); canonical runtime models are the same
-- **SPARQL Generation**: Operations convert to executable SPARQL
+- **Internal compilation**: Triple patches compile to rdflib UPDATE queries at apply time
 - **Token Savings**: Typically 80–95% fewer output tokens vs full graph regeneration
 
 ## RDF 1.2 Provenance
@@ -30,6 +30,38 @@ OntoCast uses **pyoxigraph** for RDF 1.2 quoted-triple syntax and separates prov
 - API clients can pass `strip_provenance=true` to omit reification scaffolding from returned Turtle
 
 See [Workflow](workflow.md#4-ontology-reduce-document-level).
+
+## Structured documents (optional)
+
+For papers and other heading-structured Markdown text, `/process` and `ontocast --input-path` accept optional parameters. When both `target_sections` and `summarize_sections` are omitted, the pipeline stays `convert → chunk → extract` with no extra graph nodes.
+
+### Section tagging and section-aligned chunks
+
+When `target_sections` or `summarize_sections` is set, the **Chunk** node runs a single prepare pipeline:
+
+1. **Segment** — Docling `HybridChunker` segments for layout-aware PDFs/DOCX; if none, semantic chunking on exported markdown (plain or weak structure).
+2. **Coalesce** — undersized segments merge into the right neighbor (trailing tiny segments merge left); short abstract headings are preserved; section boundaries come from heading lines and Docling breadcrumbs.
+3. **Tag** — heading regex on exported markdown (`ontocast.config.section_labels` YAML), optional front-matter abstract span, overlap labeling, then parallel LLM backfill for unlabeled segments at or above `CHUNK_SECTION_TAG_MIN_CHARS` (`PARALLEL_WORKERS`).
+4. **Filter** — `target_sections` allowlist, or `summarize_sections` allowlist when `target_sections` is omitted (not `*`).
+5. **Size** — split oversized segments (semantic when available), merge undersized consecutive same-label chunks to `min_size` / `max_size`.
+
+**Schema selection:** `section_schema_id` (e.g. `academic`, `financial`, `legal`, `clinical`, `manual`, `fiction`, `general`) or `document_type_hint` (substring match in `manifest.yaml`, e.g. `10-Q` → financial). Default is `academic`.
+
+Recognized labels are canonical ids from the active schema (underscore form), e.g. `results`, `md_and_a`, `risk_factors`.
+
+### Optional summarization
+
+When `summarize_sections` is present (including empty or `*` for all units), the **Summarize Chunks** node runs an LLM pass per selected unit (bounded by `PARALLEL_WORKERS`). Summaries are stored on `ContentUnit.summary`; render and critic agents read `extraction_text`, which prefers the summary over the raw chunk.
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `target_sections` | omitted | Section prepare + keep only listed sections (e.g. `results,methods`) |
+| `summarize_sections` | omitted | Section prepare + summarization node; omit to skip summaries. `*` or empty = all chunks after prepare |
+| `summary_max_sentences` | `5` | Max sentences per summary when summarization runs |
+| `section_schema_id` | omitted (`academic`) | Section label YAML schema (`financial`, `legal`, `clinical`, `manual`, `fiction`, `general`) |
+| `document_type_hint` | omitted | Free-text hint to resolve schema when `section_schema_id` is not set |
+
+Section lists accept comma-separated values or a JSON array in query, form, or JSON body fields.
 
 ## Parallel Map/Reduce
 
@@ -96,11 +128,12 @@ Details: [Tenancy](tenancy.md).
 
 ## Budget Tracking
 
-- **LLM Statistics**: API calls, characters sent/received
+- **LLM Statistics**: API calls, characters sent/received; optional token counts when the provider reports usage metadata
+- **Cache hits**: Disk-cache hits increment `cache_hits` and character totals but **not** `calls_count` (no provider tokens)
 - **Triple Metrics**: Ontology and facts triples per operation
 - **Summary Reports**: Logged at end of processing:
   ```
-  LLM: X calls, Y sent, Z received | Triples: A ontology, B facts
+  LLM: X calls, Y sent, Z received, N cache hits | Triples: A ontology, B facts
   ```
 - **BudgetTracker** lives on `AgentState` and per-unit states; merged at reduce stages
 
@@ -113,8 +146,8 @@ Details: [Tenancy](tenancy.md).
 | `AgentState` | Document-level workflow state |
 | `UnitOntologyState` / `UnitFactsState` | Per-unit loop state |
 | `ToolBox` | LLM, triple store, chunking, vector store, cache |
-| `GraphUpdate` | Structured SPARQL operations from the LLM |
-| `ContentUnit` | One chunk's ontology/facts outputs |
+| `GraphUpdate` | Structured insert/delete triple patches from the LLM |
+| `ContentUnit` | One chunk's text, optional `section_label` / `summary`, and ontology/facts outputs (`extraction_text` for LLM prompts) |
 
 ## Next Steps
 

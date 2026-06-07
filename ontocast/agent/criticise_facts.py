@@ -1,7 +1,6 @@
-"""Enhanced fact criticism agent with memory and SPARQL operations.
+"""Fact criticism agent.
 
-This module provides enhanced functionality for analyzing and validating facts
-with SPARQL operation support.
+This module provides functionality for analyzing and validating extracted facts.
 """
 
 import logging
@@ -22,6 +21,7 @@ from ontocast.prompt.criticise_facts import (
     template_prompt,
 )
 from ontocast.prompt.graph_format import get_graph_format_profile
+from ontocast.prompt.web_grounding import persist_search_request, search_guidelines_for
 from ontocast.tool.atomic import AtomicToolBox
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,7 @@ def _build_quarantine_chapter(state: UnitFactsState) -> str:
 async def criticise_facts(
     state: UnitFactsState, tools: AtomicToolBox
 ) -> UnitFactsState:
-    """Enhanced criticize facts with SPARQL operations.
-
-    This function performs a critical analysis of the facts in the current content unit,
-    with SPARQL operation support.
+    """Critically analyze facts in the current content unit.
 
     Args:
         state: The current unit facts state containing the chunk to analyze.
@@ -77,7 +74,7 @@ async def criticise_facts(
         state.content_unit.graph
     ) + _build_quarantine_chapter(state)
 
-    text_chapter = text_template.format(text=state.content_unit.text)
+    text_chapter = text_template.format(text=state.content_unit.extraction_text)
 
     user_instruction = (
         user_template.format(user_instruction=state.facts_user_instruction)
@@ -100,16 +97,28 @@ async def criticise_facts(
     )
 
     graph_format_instruction = profile.critique_graph_instruction()
+    web_search_enabled = tools.web_grounding_enabled_for_node(
+        WorkflowNode.CRITICISE_FACTS
+    )
+    search_guidelines = search_guidelines_for(
+        WorkflowNode.CRITICISE_FACTS, web_search_enabled
+    )
+    evaluation_instruction_str = evaluation_instruction
+    if search_guidelines:
+        evaluation_instruction_str = f"{evaluation_instruction}\n\n{search_guidelines}"
 
     prompt_data = {
         "preamble": preamble,
-        "evaluation_instruction": evaluation_instruction,
+        "evaluation_instruction": evaluation_instruction_str,
         "user_instruction": user_instruction,
         "ontology_chapter": ontology_chapter,
         "facts_chapter": facts_chapter,
         "text_chapter": text_chapter,
         "graph_format_instruction": graph_format_instruction,
-        "format_instructions": profile.format_instructions(FactsCritiqueReport),
+        "format_instructions": profile.format_instructions(
+            FactsCritiqueReport,
+            web_search_enabled=web_search_enabled,
+        ),
     }
 
     try:
@@ -120,8 +129,11 @@ async def criticise_facts(
             prompt_kwargs=prompt_data,
             llm_graph_format=state.llm_graph_format,
         )
-        state.set_external_evidence_request(
-            WorkflowNode.CRITICISE_FACTS, critique.external_evidence_request
+        persist_search_request(
+            state,
+            WorkflowNode.CRITICISE_FACTS,
+            critique.external_evidence_request,
+            web_search_enabled,
         )
 
         logger.debug(

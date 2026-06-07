@@ -1,8 +1,11 @@
+import asyncio
 import importlib
 import logging
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from rdflib import OWL, RDF, BNode, Literal, URIRef
@@ -19,6 +22,7 @@ from ontocast.config import (
 )
 from ontocast.onto.constants import ONTOLOGY_NULL_IRI, PROV, RDF_REIFIES, SCHEMA
 from ontocast.onto.content_unit import ContentUnit, OutputType, SourceUnit
+from ontocast.onto.docling_helpers import plain_text_to_docling_doc
 from ontocast.onto.enum import (
     LLMGraphFormat,
     OntologyAssemblyMode,
@@ -36,7 +40,7 @@ from ontocast.onto.model import (
 )
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
-from ontocast.onto.sparql_models import GenericSparqlQuery, GraphUpdate, TripleOp
+from ontocast.onto.sparql_models import GraphUpdate, TripleOp
 from ontocast.onto.state import AgentState
 from ontocast.onto.unit_states import UnitFactsState, UnitOntologyState
 from ontocast.stategraph import create_agent_graph
@@ -44,11 +48,12 @@ from ontocast.stategraph.context_resolver import UnitOntologyContext
 from ontocast.stategraph.helpers import build_ontology_delta_graph
 from ontocast.stategraph.node_factories import make_normalize_ontology_node
 from ontocast.stategraph.routing import (
-    route_after_chunk,
     route_after_ontology_consolidation,
+    route_after_tag_or_chunk,
 )
 from ontocast.tool import EmbeddingBasedAggregator
 from ontocast.tool.atomic import AtomicToolBox, SearchHit
+from ontocast.tool.chunk.prepare import PreparedChunk
 from ontocast.toolbox import ToolBox
 
 render_ontology_module = importlib.import_module("ontocast.agent.render_ontology")
@@ -413,6 +418,7 @@ async def test_render_ontology_update_adds_external_evidence_when_enabled(
         AtomicToolBox,
         SimpleNamespace(
             get_llm_tool=fake_get_llm_tool,
+            web_grounding_enabled_for_node=lambda _node: True,
         ),
     )
     state = UnitOntologyState(
@@ -457,6 +463,7 @@ async def test_criticise_ontology_skips_external_evidence_when_disabled(
         AtomicToolBox,
         SimpleNamespace(
             get_llm_tool=fake_get_llm_tool,
+            web_grounding_enabled_for_node=lambda _node: False,
         ),
     )
     state = UnitOntologyState(
@@ -494,6 +501,7 @@ async def test_criticise_ontology_prompt_includes_graph_format_instruction(
         AtomicToolBox,
         SimpleNamespace(
             get_llm_tool=fake_get_llm_tool,
+            web_grounding_enabled_for_node=lambda _node: False,
         ),
     )
     state = UnitOntologyState(
@@ -806,9 +814,9 @@ def test_agent_graph_structural_check_not_reached_from_facts_edges() -> None:
     assert incoming_from_facts == []
 
 
-def test_route_after_chunk_facts_only_skips_ontology() -> None:
+def test_route_after_tag_or_chunk_facts_only_skips_ontology() -> None:
     facts_only = AgentState(render_mode=RenderMode.FACTS)
-    assert route_after_chunk(facts_only) == WorkflowNode.RENDER_FACTS
+    assert route_after_tag_or_chunk(facts_only) == WorkflowNode.RENDER_FACTS
 
 
 def test_toolbox_serialize_skips_facts_in_ontology_only_mode() -> None:
@@ -906,7 +914,7 @@ def test_toolbox_serialize_persists_all_ontology_artifacts() -> None:
     assert all(isinstance(payload, Ontology) for payload, _ in store.calls)
 
 
-def test_render_updated_graph_splits_compound_sparql_insert_updates() -> None:
+def test_apply_update_query_splits_compound_sparql_insert_updates() -> None:
     graph = RDFGraph()
     graph.parse(
         data="""
@@ -915,34 +923,26 @@ def test_render_updated_graph_splits_compound_sparql_insert_updates() -> None:
         """,
         format="turtle",
     )
-    update = GraphUpdate(
-        sparql_operations=[
-            GenericSparqlQuery(
-                query=(
-                    "PREFIX ex: <http://example.org/>\n"
-                    "INSERT DATA { ex:Person ex:label ex:Alice }\n"
-                    "INSERT DATA { ex:Person ex:status ex:Active }"
-                )
-            )
-        ]
+    compound_query = (
+        "PREFIX ex: <http://example.org/>\n"
+        "INSERT DATA { ex:Person ex:label ex:Alice }\n"
+        "INSERT DATA { ex:Person ex:status ex:Active }"
     )
+    AgentState._apply_update_query(graph, compound_query)
 
-    updated_graph, was_applied = AgentState.render_updated_graph(graph, [update])
-
-    assert was_applied is True
     assert (
         URIRef("http://example.org/Person"),
         URIRef("http://example.org/label"),
         URIRef("http://example.org/Alice"),
-    ) in updated_graph
+    ) in graph
     assert (
         URIRef("http://example.org/Person"),
         URIRef("http://example.org/status"),
         URIRef("http://example.org/Active"),
-    ) in updated_graph
+    ) in graph
 
 
-def test_render_updated_graph_splits_compound_sparql_with_many_prefixes() -> None:
+def test_apply_update_query_splits_compound_sparql_with_many_prefixes() -> None:
     """Regression: shared PREFIX block + second INSERT at ~line 44 (Text2KGBench style)."""
     from ontocast.onto.sparql_models import STANDARD_PREFIXES
 
@@ -961,12 +961,9 @@ def test_render_updated_graph_splits_compound_sparql_with_many_prefixes() -> Non
         "INSERT DATA { <http://example.org/a> <http://example.org/p2> "
         "<http://example.org/o2> . }"
     )
-    update = GraphUpdate(sparql_operations=[GenericSparqlQuery(query=compound_query)])
+    AgentState._apply_update_query(graph, compound_query)
 
-    updated_graph, was_applied = AgentState.render_updated_graph(graph, [update])
-
-    assert was_applied is True
-    assert len(list(updated_graph)) >= 3
+    assert len(list(graph)) >= 3
 
 
 def test_apply_update_query_splits_insert_where_plus_insert_data() -> None:
@@ -1064,18 +1061,45 @@ def test_chunk_text_resets_content_units_on_each_call() -> None:
     previous invocations, leading to duplicate processing.
     """
 
-    class FakeChunker:
-        def __call__(self, text: str) -> list[str]:
-            return [text]
+    from docling_core.types.doc import DoclingDocument
 
-    tools = SimpleNamespace(chunker=FakeChunker())
-    state = AgentState(render_mode=RenderMode.ONTOLOGY)
-    state.set_text("first invocation text")
-    _chunk_text(state, cast(ToolBox, tools))
-    assert len(state.content_units) == 1
+    from ontocast.config import ChunkConfig
+    from ontocast.tool.chunk.chunker import ChunkerTool
+    from ontocast.tool.chunk.prepare import PrepareOptions
 
-    state.set_text("second invocation text")
-    _chunk_text(state, cast(ToolBox, tools))
-    assert len(state.content_units) == 1, (
-        "content_units should be reset per call, not accumulated across calls"
+    config = ChunkConfig()
+    chunker = ChunkerTool(chunk_config=config)
+
+    async def fake_prepare(
+        docling_doc: DoclingDocument,
+        splitter: ChunkerTool,
+        config: ChunkConfig,
+        options: PrepareOptions,
+        tools: ToolBox,
+    ) -> list[PreparedChunk]:
+        text = docling_doc.export_to_markdown().strip()
+        return [PreparedChunk(text=text, headings=None)]
+
+    _PrepareContentUnits = Callable[
+        [DoclingDocument, ChunkerTool, ChunkConfig, PrepareOptions, ToolBox],
+        Coroutine[Any, Any, list[PreparedChunk]],
+    ]
+    patched_prepare: _PrepareContentUnits = fake_prepare
+
+    tools = SimpleNamespace(
+        chunker=chunker,
+        embedding_tool=SimpleNamespace(embed=lambda texts: [[0.0] for _ in texts]),
     )
+    import ontocast.tool.chunk.prepare as prepare_module
+
+    with patch.object(prepare_module, "prepare_content_units", patched_prepare):
+        state = AgentState(render_mode=RenderMode.ONTOLOGY)
+        state.set_docling_doc(plain_text_to_docling_doc("first invocation text", "doc"))
+        asyncio.run(_chunk_text(state, cast(ToolBox, tools)))
+        assert len(state.content_units) == 1
+
+        state.set_docling_doc(
+            plain_text_to_docling_doc("second invocation text", "doc")
+        )
+        asyncio.run(_chunk_text(state, cast(ToolBox, tools)))
+        assert len(state.content_units) == 1

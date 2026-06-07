@@ -1,8 +1,10 @@
 """Tests for GraphFormatProfile and format-bound canonical LLM parsers."""
 
 import json
+from unittest.mock import Mock
 
 import pytest
+from pydantic import BaseModel
 
 from ontocast.onto.enum import LLMGraphFormat
 from ontocast.onto.llm_graph_payload import (
@@ -15,6 +17,7 @@ from ontocast.onto.model import (
     FactsCritiqueReport,
     FactsRenderReport,
     GraphUpdateRenderReport,
+    OntologyCritiqueReport,
     OntologyRenderReport,
     Suggestions,
 )
@@ -22,6 +25,7 @@ from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.onto.sparql_models import GraphUpdate
 from ontocast.prompt.graph_format import get_graph_format_profile
 from ontocast.prompt.llm_json_schema import schema_for_model
+from ontocast.prompt.web_grounding import WEB_SEARCH_REQUEST_FIELD
 
 
 @pytest.mark.parametrize("fmt", list(LLMGraphFormat))
@@ -42,6 +46,29 @@ def test_turtle_update_instruction_names_triple_op_graph() -> None:
     text = profile.render_update_output_instruction()
     assert "TripleOp.graph" in text
     assert "Turtle string" in text
+
+
+def test_graph_update_instruction_does_not_mention_sparql() -> None:
+    for fmt in LLMGraphFormat:
+        profile = get_graph_format_profile(fmt)
+        text = profile.render_update_output_instruction()
+        assert "sparql_operations" not in text
+        assert "Generate SPARQL" not in text
+        lower = text.lower()
+        assert "generate sparql" not in lower
+
+
+def test_graph_update_instruction_forbids_sparql_in_graph_field() -> None:
+    profile = get_graph_format_profile(LLMGraphFormat.TURTLE)
+    text = profile.render_update_output_instruction()
+    assert "NEVER use UPDATE query syntax" in text
+
+
+def test_graph_update_schema_has_no_sparql_operations() -> None:
+    schema = schema_for_model(GraphUpdateRenderReport, LLMGraphFormat.TURTLE)
+    graph_update_def = schema["$defs"]["GraphUpdate"]
+    assert "sparql_operations" not in graph_update_def.get("properties", {})
+    assert "GenericSparqlQuery" not in schema.get("$defs", {})
 
 
 def test_jsonld_operational_guidelines_forbid_caret_caret() -> None:
@@ -83,14 +110,30 @@ def test_strict_jsonld_rejects_turtle_string() -> None:
         )
 
 
-def test_coerce_llm_graph_wire_uses_context() -> None:
+def test_coerce_llm_graph_wire_uses_validation_context() -> None:
+    info = Mock()
+    info.context = {"llm_graph_format": LLMGraphFormat.JSONLD}
+    graph = coerce_llm_graph_wire(
+        {
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:item", "@type": "ex:Thing"}],
+        },
+        info,
+    )
+    assert len(graph) >= 1
+
+
+def test_coerce_llm_graph_wire_falls_back_to_contextvar() -> None:
+    info = Mock()
+    info.context = None
     token = llm_graph_format_ctx.set(LLMGraphFormat.JSONLD)
     try:
         graph = coerce_llm_graph_wire(
             {
                 "@context": {"ex": "http://example.org/"},
                 "@graph": [{"@id": "ex:item", "@type": "ex:Thing"}],
-            }
+            },
+            info,
         )
         assert len(graph) >= 1
     finally:
@@ -125,7 +168,7 @@ def test_parse_report_jsonld_facts_is_canonical() -> None:
     assert len(report.semantic_graph) >= 1
 
 
-def test_parse_report_turtle_graph_update_has_generate_sparql() -> None:
+def test_parse_report_turtle_graph_update_compiles_to_insert_data() -> None:
     profile = get_graph_format_profile(LLMGraphFormat.TURTLE)
     payload = {
         "graph_update": {
@@ -137,7 +180,6 @@ def test_parse_report_turtle_graph_update_has_generate_sparql() -> None:
                     ),
                 }
             ],
-            "sparql_operations": [],
         },
         "external_evidence_request": {
             "initiate_search": False,
@@ -221,7 +263,6 @@ def test_parsed_graph_update_applies_via_unit_facts_state() -> None:
                     ),
                 }
             ],
-            "sparql_operations": [],
         },
         "external_evidence_request": {
             "initiate_search": False,
@@ -250,3 +291,49 @@ def test_format_instructions_no_dual_or_on_graph_fields() -> None:
         instructions = profile.format_instructions(OntologyRenderReport)
         assert "Turtle string OR" not in instructions
         assert "OR a compact JSON-LD" not in instructions
+
+
+_SEARCH_MARKERS = (
+    "external_evidence_request",
+    "ExternalEvidenceRequest",
+    "initiate_search",
+)
+
+_REPORT_MODELS = (
+    OntologyRenderReport,
+    GraphUpdateRenderReport,
+    FactsRenderReport,
+    OntologyCritiqueReport,
+    FactsCritiqueReport,
+)
+
+
+@pytest.mark.parametrize("report_cls", _REPORT_MODELS)
+@pytest.mark.parametrize("fmt", list(LLMGraphFormat))
+def test_schema_omits_web_search_when_disabled(
+    report_cls: type[BaseModel],
+    fmt: LLMGraphFormat,
+) -> None:
+    schema = schema_for_model(report_cls, fmt, web_search_enabled=False)
+    assert WEB_SEARCH_REQUEST_FIELD not in schema.get("properties", {})
+    defs = schema.get("$defs", {})
+    assert "ExternalEvidenceRequest" not in defs
+
+    profile = get_graph_format_profile(fmt)
+    instructions = profile.format_instructions(
+        report_cls,
+        web_search_enabled=False,
+    )
+    for marker in _SEARCH_MARKERS:
+        assert marker not in instructions
+
+
+@pytest.mark.parametrize("report_cls", _REPORT_MODELS)
+@pytest.mark.parametrize("fmt", list(LLMGraphFormat))
+def test_schema_includes_web_search_when_enabled(
+    report_cls: type[BaseModel],
+    fmt: LLMGraphFormat,
+) -> None:
+    schema = schema_for_model(report_cls, fmt, web_search_enabled=True)
+    assert "external_evidence_request" in schema.get("properties", {})
+    assert "ExternalEvidenceRequest" in schema.get("$defs", {})

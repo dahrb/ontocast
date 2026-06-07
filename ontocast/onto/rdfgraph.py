@@ -6,7 +6,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from contextvars import ContextVar
 from decimal import Decimal, InvalidOperation
-from typing import Any, Union
+from typing import Any, Union, cast
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler
 from pydantic_core import core_schema
@@ -17,9 +17,18 @@ from rdflib.namespace import XSD, NamespaceManager
 from ontocast.onto.constants import COMMON_PREFIXES, prefix_lookup_for_ingest
 from ontocast.onto.enum import LLMGraphFormat
 from ontocast.onto.iri_policy import normalize_namespace_iri, sanitize_prefix_map
-from ontocast.util import render_text_hash
+from ontocast.util.hash import render_text_hash
 
 logger = logging.getLogger(__name__)
+
+
+def _oxigraph_inner_store(rdflib_store: object) -> object:
+    """Return the underlying pyoxigraph ``Store`` from an ``OxigraphStore``."""
+    inner = getattr(rdflib_store, "_inner", None)
+    if inner is None:
+        raise RuntimeError("Expected an OxigraphStore with a pyoxigraph _inner store")
+    return inner
+
 
 PREFIX_PATTERN = re.compile(r"@prefix\s+(\w+):\s+<[^>]+>\s+\.")
 PREFIX_DECLARATION_PATTERN = re.compile(r"@prefix\s+(\w+):\s+<([^>]+)>\s+\.")
@@ -28,7 +37,9 @@ PREFIX_USAGE_PATTERN = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*):[^\s]")
 INTEGER_TYPED_LITERAL_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^xsd:integer')
 DECIMAL_TYPED_LITERAL_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^xsd:decimal')
 DOUBLE_TYPED_LITERAL_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^xsd:double')
-DATE_TYPED_LITERAL_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^xsd:date')
+DATE_TYPED_LITERAL_PATTERN = re.compile(
+    r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^xsd:date(?!Time)'
+)
 NQUADS_INTEGER_TYPED_LITERAL_PATTERN = re.compile(
     r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^<http://www\.w3\.org/2001/XMLSchema#integer>'
 )
@@ -39,13 +50,21 @@ NQUADS_DOUBLE_TYPED_LITERAL_PATTERN = re.compile(
     r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^<http://www\.w3\.org/2001/XMLSchema#double>'
 )
 NQUADS_DATE_TYPED_LITERAL_PATTERN = re.compile(
-    r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^<http://www\.w3\.org/2001/XMLSchema#date>'
+    r'"([^"\\]*(?:\\.[^"\\]*)*)"\^\^<http://www\.w3\.org/2001/XMLSchema#date(?!Time)>'
 )
 XSD_GYEAR_IRI = "http://www.w3.org/2001/XMLSchema#gYear"
 UNKNOWN_PREFIX_ERROR_PATTERN = re.compile(r"Unknown namespace prefix\s*:\s*(\w+)")
 # Bare numeric value followed by ^^ datatype — missing surrounding quotes
 UNQUOTED_TYPED_LITERAL_PATTERN = re.compile(
     r'(?<!")\b(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\^\^([\w:]+)'
+)
+_SPARQL_DATA_BLOCK_RE = re.compile(
+    r"(?:INSERT|DELETE)\s+DATA\s*\{([^}]*)\}",
+    re.IGNORECASE | re.DOTALL,
+)
+_SPARQL_PREFIX_RE = re.compile(
+    r"^PREFIX\s+(\w*):\s*<([^>]+)>\s*\.?",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 _INVALID_DECIMAL_LEXICALS = frozenset(
@@ -102,6 +121,52 @@ def _format_namespace_uri_for_turtle_declaration(namespace_uri: str) -> str:
     if namespace_uri.startswith("<") and namespace_uri.endswith(">"):
         return namespace_uri
     return f"<{namespace_uri}>"
+
+
+def strip_sparql_update_wrapper(turtle_str: str) -> str:
+    """Extract plain Turtle from LLM output that mixed Turtle with SPARQL UPDATE."""
+    if not _SPARQL_DATA_BLOCK_RE.search(turtle_str):
+        return turtle_str
+
+    text = _SPARQL_PREFIX_RE.sub(
+        lambda match: f"@prefix {match.group(1)}: <{match.group(2)}> .",
+        turtle_str,
+    )
+
+    prefix_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("@prefix"):
+            if not stripped.endswith("."):
+                stripped = f"{stripped} ."
+            prefix_lines.append(stripped)
+
+    bodies = _SPARQL_DATA_BLOCK_RE.findall(text)
+    outside = _SPARQL_DATA_BLOCK_RE.sub("", text)
+    outside = re.sub(
+        r"(?:INSERT|DELETE)\s+DATA\s*",
+        "",
+        outside,
+        flags=re.IGNORECASE,
+    )
+    outside = re.sub(r"^\s*}\s*$", "", outside, flags=re.MULTILINE)
+
+    outside_triples: list[str] = []
+    for line in outside.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("@prefix"):
+            continue
+        outside_triples.append(stripped)
+
+    triple_parts = outside_triples + [body.strip() for body in bodies if body.strip()]
+    if not triple_parts:
+        return turtle_str
+
+    result_parts: list[str] = []
+    if prefix_lines:
+        result_parts.append("\n".join(dict.fromkeys(prefix_lines)))
+    result_parts.append("\n".join(triple_parts))
+    return "\n\n".join(result_parts) + "\n"
 
 
 def _prefix_lookup_for_turtle_repair() -> dict[str, str]:
@@ -516,6 +581,10 @@ class RDFGraph(Graph):
                 repaired_turtle = cls._repair_unknown_prefix(
                     patched_turtle, error_message
                 )
+            if repaired_turtle == patched_turtle and _SPARQL_DATA_BLOCK_RE.search(
+                patched_turtle
+            ):
+                repaired_turtle = strip_sparql_update_wrapper(patched_turtle)
             if repaired_turtle == patched_turtle:
                 raise
             logger.warning(
@@ -567,7 +636,12 @@ class RDFGraph(Graph):
             if unicodedata.category(ch).startswith("C"):
                 continue
             cleaned_chars.append(ch)
-        return "".join(cleaned_chars)
+        normalized = "".join(cleaned_chars)
+        normalized = _SPARQL_PREFIX_RE.sub(
+            lambda match: f"@prefix {match.group(1)}: <{match.group(2)}> .",
+            normalized,
+        )
+        return normalized
 
     @staticmethod
     def _quote_unquoted_typed_literals(turtle_str: str) -> str:
@@ -788,6 +862,12 @@ class RDFGraph(Graph):
         # LLM repeats the subject on lines that follow a ';' continuation.
         if "expected '.' or '}' or ']' at end of statement" in parse_error_message:
             repaired = cls._repair_repeated_subject_after_semicolon(repaired)
+
+        if (
+            "Expected end of text, found 'DELETE'" in parse_error_message
+            or "Expected end of text, found 'INSERT'" in parse_error_message
+        ):
+            repaired = strip_sparql_update_wrapper(repaired)
 
         repaired = cls._repair_missing_object_before_dot(repaired)
         return repaired
@@ -1041,7 +1121,7 @@ class RDFGraph(Graph):
                 "pyoxigraph / oxrdflib must be installed for Turtle-star serialisation"
             ) from exc
 
-        inner_store: ox.Store = self.store._inner  # type: ignore[attr-defined]
+        inner_store = cast(ox.Store, _oxigraph_inner_store(self.store))
         graph_ctx_raw = to_ox(self.identifier)
         assert isinstance(
             graph_ctx_raw,
@@ -1094,11 +1174,13 @@ class RDFGraph(Graph):
             for namespace, prefix in namespace_to_prefix.items()
             if any(iri.startswith(namespace) for iri in used_iri_terms)
         }
-        raw: bytes = tmp.dump(
+        raw = tmp.dump(
             format=ox.RdfFormat.TURTLE,
             from_graph=ox.DefaultGraph(),
             prefixes=prefixes or None,
-        )  # type: ignore[assignment]
+        )
+        if raw is None:
+            raise RuntimeError("pyoxigraph dump returned no data")
         return raw.decode()
 
     def serialize_canonical_turtle(self) -> str:
@@ -1345,6 +1427,13 @@ class RDFGraph(Graph):
 
         for stem, count in stem_counts.items():
             if count < 2:
+                continue
+            # Skip stems that are a strict URI prefix of an already-declared namespace
+            # — they are parent-directory IRIs, not domain namespaces.
+            if any(
+                other_ns != stem and other_ns.startswith(stem)
+                for other_ns in declared_namespaces
+            ):
                 continue
             slug = stem.rstrip("#/").rsplit("/", 1)[-1].replace("-", "_")
             prefix = f"{prefix_base}_{slug}" if prefix_base else slug

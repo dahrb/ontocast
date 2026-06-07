@@ -33,6 +33,7 @@ from ontocast.prompt.render_facts import (
     preamble,
     template_prompt,
 )
+from ontocast.prompt.web_grounding import persist_search_request, search_guidelines_for
 from ontocast.tool.atomic import AtomicToolBox
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,10 @@ async def render_facts(
     tools: AtomicToolBox,
     supplemental_ontologies: Sequence[Ontology] | None = None,
 ) -> UnitFactsState:
-    """Structured hybrid facts renderer with Turtle/SPARQL decision logic.
+    """Structured hybrid facts renderer: fresh Turtle or structured graph updates.
 
     This function decides between generating bare Turtle for fresh facts
-    and SPARQL operations for updates based on whether facts exist.
+    and structured TripleOp graph patches for updates based on whether facts exist.
 
     Args:
         state: The current unit facts state
@@ -74,6 +75,8 @@ def _prepare_prompt_data(
     state: UnitFactsState,
     access: UnitFactsOntologyAccess,
     profile,
+    *,
+    search_guidelines: str = "",
 ) -> dict[str, str]:
     """Prepare common prompt data for both fresh and update rendering.
 
@@ -100,9 +103,10 @@ def _prepare_prompt_data(
     facts_instruction_str = profile.facts_operational_guidelines(
         facts_namespace=DEFAULT_IRI,
         domain_ontologies_clause=format_ontologies_clause(domain_pairs),
+        search_guidelines=search_guidelines,
     )
 
-    text_chapter = text_template.format(text=state.content_unit.text)
+    text_chapter = text_template.format(text=state.content_unit.extraction_text)
 
     fact_chapter = ""
 
@@ -188,7 +192,17 @@ async def render_facts_fresh(
         supplemental_ontologies or (),
     )
 
-    prompt_data = _prepare_prompt_data(state, access, profile)
+    web_search_enabled = tools.web_grounding_enabled_for_node(
+        WorkflowNode.TEXT_TO_FACTS
+    )
+    prompt_data = _prepare_prompt_data(
+        state,
+        access,
+        profile,
+        search_guidelines=search_guidelines_for(
+            WorkflowNode.TEXT_TO_FACTS, web_search_enabled
+        ),
+    )
     prompt_data_fresh = {
         "preamble": preamble,
         "improvement_instruction": "",
@@ -207,13 +221,19 @@ async def render_facts_fresh(
             prompt=prompt,
             parser=parser,
             prompt_kwargs={
-                "format_instructions": profile.format_instructions(FactsRenderReport),
+                "format_instructions": profile.format_instructions(
+                    FactsRenderReport,
+                    web_search_enabled=web_search_enabled,
+                ),
                 **prompt_data,
             },
             llm_graph_format=state.llm_graph_format,
         )
-        state.set_external_evidence_request(
-            WorkflowNode.TEXT_TO_FACTS, render_report.external_evidence_request
+        persist_search_request(
+            state,
+            WorkflowNode.TEXT_TO_FACTS,
+            render_report.external_evidence_request,
+            web_search_enabled,
         )
         render_report.semantic_graph.sanitize_prefixes_namespaces()
         clean_graph, rejected = finalize_llm_graph(render_report.semantic_graph)
@@ -246,7 +266,7 @@ async def render_facts_update(
     tools: AtomicToolBox,
     supplemental_ontologies: Sequence[Ontology] | None = None,
 ) -> UnitFactsState:
-    """Render facts updates using SPARQL operations.
+    """Render facts updates using structured graph patch operations.
 
     Args:
         state: The current unit facts state containing the chunk to render.
@@ -262,7 +282,17 @@ async def render_facts_update(
     parser = PydanticOutputParser(pydantic_object=GraphUpdateRenderReport)
 
     access = ontology_access_for_unit_facts(state)
-    prompt_data = _prepare_prompt_data(state, access, profile)
+    web_search_enabled = tools.web_grounding_enabled_for_node(
+        WorkflowNode.TEXT_TO_FACTS
+    )
+    prompt_data = _prepare_prompt_data(
+        state,
+        access,
+        profile,
+        search_guidelines=search_guidelines_for(
+            WorkflowNode.TEXT_TO_FACTS, web_search_enabled
+        ),
+    )
     prompt_data_update = {
         "preamble": preamble,
         "improvement_instruction": render_suggestions_prompt(
@@ -288,14 +318,18 @@ async def render_facts_update(
             parser=parser,
             prompt_kwargs={
                 "format_instructions": profile.format_instructions(
-                    GraphUpdateRenderReport
+                    GraphUpdateRenderReport,
+                    web_search_enabled=web_search_enabled,
                 ),
                 **prompt_data,
             },
             llm_graph_format=state.llm_graph_format,
         )
-        state.set_external_evidence_request(
-            WorkflowNode.TEXT_TO_FACTS, render_report.external_evidence_request
+        persist_search_request(
+            state,
+            WorkflowNode.TEXT_TO_FACTS,
+            render_report.external_evidence_request,
+            web_search_enabled,
         )
         graph_update = render_report.graph_update
         all_rejected = []
@@ -327,7 +361,7 @@ async def render_facts_update(
 
     except Exception as e:
         return _handle_rendering_error(
-            state, e, FailureStage.GENERATE_SPARQL_UPDATE_FOR_FACTS
+            state, e, FailureStage.GENERATE_GRAPH_UPDATE_FOR_FACTS
         )
     finally:
         # Clear the context after parsing

@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 
-from ontocast.util import render_text_hash
+from ontocast.util.hash import render_text_hash
 
 logger = logging.getLogger(__name__)
 
@@ -228,8 +228,9 @@ class Cacher:
                 logger.info(f"Cleared cache directory: {tool_cache_dir}")
 
     def get_cache_stats(
-        self, subdirectory: str | None = None
-    ) -> dict[str, int | dict[str, int]]:
+        self,
+        subdirectory: str | None = None,
+    ) -> dict[str, int | dict[str, int] | dict[str, dict[str, int]]]:
         """Get cache statistics.
 
         Args:
@@ -339,7 +340,9 @@ class ToolCacher:
         """Clear cached results for this tool."""
         self.shared_cacher.clear(subdirectory=self.subdirectory)
 
-    def get_cache_stats(self) -> dict[str, int | dict[str, int]]:
+    def get_cache_stats(
+        self,
+    ) -> dict[str, int | dict[str, int] | dict[str, dict[str, int]]]:
         """Get cache statistics for this tool.
 
         Returns:

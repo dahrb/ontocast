@@ -5,12 +5,13 @@ import re
 from collections import defaultdict
 from typing import Any
 
-from pydantic import ConfigDict, Field
+from docling_core.types.doc import DoclingDocument
+from pydantic import ConfigDict, Field, field_validator
 from rdflib import URIRef
 
 from ontocast.onto.constants import DEFAULT_DOMAIN, ONTOLOGY_NULL_IRI
 from ontocast.onto.content_unit import ContentUnit
-from ontocast.onto.context import AgentContext, AgentType, ContextManager
+from ontocast.onto.context import ContextManager
 from ontocast.onto.enum import (
     FailureStage,
     LLMGraphFormat,
@@ -25,7 +26,7 @@ from ontocast.onto.model import BasePydanticModel, Suggestions
 from ontocast.onto.ontology import Ontology
 from ontocast.onto.rdfgraph import RDFGraph
 from ontocast.onto.sparql_models import GraphUpdate, TripleOp
-from ontocast.util import render_text_hash
+from ontocast.util.hash import render_text_hash
 
 # Top-level SPARQL update keywords at line start (used to split compound LLM output).
 _TOP_LEVEL_UPDATE_START_RE = re.compile(r"(?m)^(?=(?:INSERT|DELETE|WITH)\b)")
@@ -39,6 +40,10 @@ class BudgetTracker(BasePydanticModel):
         default=0, description="Total characters received from LLM"
     )
     calls_count: int = Field(default=0, description="Total number of LLM API calls")
+    cache_hits: int = Field(
+        default=0,
+        description="LLM calls satisfied from disk cache (no provider tokens)",
+    )
     input_tokens: int = Field(
         default=0, description="Total input tokens (when reported by provider)"
     )
@@ -77,6 +82,12 @@ class BudgetTracker(BasePydanticModel):
         if output_tokens is not None:
             self.output_tokens += output_tokens
 
+    def add_cache_hit(self, chars_sent: int, chars_received: int) -> None:
+        """Record a disk-cache hit (does not increment calls_count)."""
+        self.cache_hits += 1
+        self.chars_sent += chars_sent
+        self.chars_received += chars_received
+
     def add_ontology_update(self, num_operations: int, num_triples: int) -> None:
         """Add ontology update statistics.
 
@@ -102,6 +113,7 @@ class BudgetTracker(BasePydanticModel):
         self.chars_sent += other.chars_sent
         self.chars_received += other.chars_received
         self.calls_count += other.calls_count
+        self.cache_hits += other.cache_hits
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.ontology_triples_generated += other.ontology_triples_generated
@@ -116,6 +128,8 @@ class BudgetTracker(BasePydanticModel):
             f"{self.chars_sent:,} sent, "
             f"{self.chars_received:,} received",
         ]
+        if self.cache_hits > 0:
+            parts.append(f"{self.cache_hits:,} cache hits")
 
         if self.input_tokens > 0 or self.output_tokens > 0:
             parts.append(
@@ -138,7 +152,7 @@ class AgentState(BasePydanticModel):
     including input text, content units, ontologies, and workflow status.
 
     Attributes:
-        input_text: Input text to process.
+        docling_doc: Parsed document in native Docling format.
         current_domain: IRI used for forming document namespace.
         doc_hid: An almost unique hash/id for the parent document.
         raw_input: Single raw input payload as {filename: bytes}.
@@ -152,7 +166,10 @@ class AgentState(BasePydanticModel):
         max_chunks: Maximum number of source content units to split and process.
     """
 
-    input_text: str = Field(description="Input text", default="")
+    docling_doc: DoclingDocument | None = Field(
+        default=None,
+        description="Parsed document in native Docling format.",
+    )
     current_domain: str = Field(
         description="IRI used for forming document namespace", default=DEFAULT_DOMAIN
     )
@@ -208,7 +225,7 @@ class AgentState(BasePydanticModel):
         default_factory=dict,
         description="Per-unit ontology assembly mode (ensemble / vote majority / primary).",
     )
-    retrieval_metrics: dict[str, int | float | str] = Field(
+    retrieval_metrics: dict[str, int | float | str | dict[str, Any]] = Field(
         default_factory=dict,
         description="Runtime retrieval/evaluation metrics for observability.",
     )
@@ -326,6 +343,32 @@ class AgentState(BasePydanticModel):
         default=3, description="Maximum number of visits allowed per node"
     )
     max_chunks: int | None = None
+    target_sections: list[str] | None = Field(
+        default=None,
+        description="Sections to include when chunking. None = no filter.",
+    )
+    summarize_sections: list[str] | None = Field(
+        default=None,
+        description="Sections to summarize. None = skip summarization node.",
+    )
+    summary_max_sentences: int = Field(
+        default=5,
+        description="Max sentences per chunk summary when summarization is enabled.",
+    )
+    document_type_hint: str | None = Field(
+        default=None,
+        description=(
+            "Optional free-text hint about the source material (e.g. '10-K filing', "
+            "'journal article') used to resolve section label schema and LLM tagging."
+        ),
+    )
+    section_schema_id: str | None = Field(
+        default=None,
+        description=(
+            "Section label schema id from ontocast.config.section_labels (e.g. academic, "
+            "financial). Overrides document_type_hint when set."
+        ),
+    )
     model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
     render_mode: RenderMode = Field(
         default=RenderMode.ONTOLOGY_AND_FACTS,
@@ -380,6 +423,16 @@ class AgentState(BasePydanticModel):
     def get_node_status(self, node: WorkflowNode) -> Status:
         """Get the status of a workflow node, returning NOT_VISITED if not set."""
         return self.statuses.get(node, Status.NOT_VISITED)
+
+    @property
+    def needs_section_prepare(self) -> bool:
+        """Whether chunk prepare runs section tagging and optional filter."""
+        return self.target_sections is not None or self.summarize_sections is not None
+
+    @property
+    def use_summarization(self) -> bool:
+        """Whether the summarize_chunks node should run."""
+        return self.summarize_sections is not None
 
     @property
     def render_ontology(self) -> bool:
@@ -558,14 +611,23 @@ class AgentState(BasePydanticModel):
 
         return "\n".join(markdown_parts)
 
-    def set_text(self, text):
-        """Set the input text and generate document hash.
+    def set_docling_doc(self, doc: DoclingDocument) -> None:
+        """Set the parsed document and generate document hash.
 
         Args:
-            text: The input text to set.
+            doc: The DoclingDocument to set.
         """
-        self.input_text = text
-        self.doc_hid = render_text_hash(self.input_text)
+        self.docling_doc = doc
+        self.doc_hid = render_text_hash(doc.model_dump_json())
+
+    @field_validator("docling_doc", mode="before")
+    @classmethod
+    def _coerce_docling_doc(cls, value: object) -> DoclingDocument | None:
+        if value is None or isinstance(value, DoclingDocument):
+            return value
+        if isinstance(value, dict):
+            return DoclingDocument.model_validate(value)
+        raise TypeError(f"Expected DoclingDocument or dict, got {type(value).__name__}")
 
     def set_failure(self, stage: FailureStage, reason: str, success_score: float = 0.0):
         """Set failure state with stage and reason.
@@ -620,72 +682,3 @@ class AgentState(BasePydanticModel):
             else self.ontology_artifacts
         )
         return [ontology.ontology_id for ontology in artifacts if ontology.ontology_id]
-
-    def get_context_for_agent(self, agent_type: AgentType) -> AgentContext:
-        """Get or create context for a specific agent.
-
-        Args:
-            agent_type: Type of agent (renderer, critic, etc.).
-
-        Returns:
-            AgentContext: The context for the agent.
-        """
-        existing_context = self.context_manager.get_latest_context_by_agent(agent_type)
-
-        if existing_context:
-            return existing_context
-
-        # Create new context if none exists
-        return self.context_manager.create_context(agent_type=agent_type)
-
-    def update_context_for_agent(
-        self,
-        agent_type: AgentType,
-        ontology_version: Any | None = None,
-        facts_version: Any | None = None,
-        ontology_operations: list[Any] | None = None,
-        facts_operations: list[Any] | None = None,
-        ontology_critique: dict[str, Any] | None = None,
-        facts_critique: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> AgentContext:
-        """Update context for a specific agent.
-
-        Args:
-            agent_type: Name of the agent updating context.
-            ontology_version: New ontology version if available.
-            facts_version: New facts version if available.
-            ontology_operations: New ontology operations if available.
-            facts_operations: New facts operations if available.
-            ontology_critique: New ontology critique if available.
-            facts_critique: New facts critique if available.
-            metadata: Additional metadata for the context.
-
-        Returns:
-            AgentContext: The updated context.
-        """
-        return self.context_manager.update_context(
-            agent_type=agent_type,
-            ontology_version=ontology_version,
-            facts_version=facts_version,
-            ontology_operations=ontology_operations,
-            facts_operations=facts_operations,
-            ontology_critique=ontology_critique,
-            facts_critique=facts_critique,
-            metadata=metadata,
-        )
-
-    def get_context_summary_for_agent(self, agent_type: AgentType) -> str:
-        """Get a context summary for a specific agent.
-
-        Args:
-            agent_type: Name of the agent requesting context summary.
-
-        Returns:
-            str: A formatted context summary.
-        """
-        context = self.context_manager.get_latest_context_by_agent(agent_type)
-        if not context:
-            return "No context available for this agent."
-
-        return context.get_full_context_summary()

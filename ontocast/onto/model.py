@@ -16,8 +16,8 @@ class BasePydanticModel(BaseModel):
         """Initialize the model with given keyword arguments."""
         super().__init__(**kwargs)
 
-    def serialize(self, file_path: str | pathlib.Path) -> None:
-        """Serialize the state to a JSON file.
+    def save_json(self, file_path: str | pathlib.Path) -> None:
+        """Write model state to a JSON file.
 
         Args:
             file_path: Path to save the JSON file.
@@ -232,7 +232,9 @@ class FactsRenderReport(BaseModel):
 class GraphUpdateRenderReport(BaseModel):
     """Graph update rendering output with optional search decision."""
 
-    graph_update: GraphUpdate = Field(description="SPARQL graph update payload.")
+    graph_update: GraphUpdate = Field(
+        description="Structured graph patch payload: ordered insert/delete triple operations."
+    )
     external_evidence_request: ExternalEvidenceRequest = Field(
         default_factory=ExternalEvidenceRequest,
         description="Optional request to run web search before retrying.",
@@ -358,8 +360,15 @@ class TripleFix(BaseModel):
 
 def _coerce_critique_score(v: object) -> float:
     """Coerce LLM score output (may be a JSON string) to float."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
     try:
-        return float(v)  # type: ignore[arg-type]
+        return float(str(v))
     except (TypeError, ValueError):
         return 0.0
 

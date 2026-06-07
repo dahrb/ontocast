@@ -21,6 +21,7 @@ from ontocast.tool import (
     FusekiTripleStoreManager,
     Neo4jTripleStoreManager,
 )
+from ontocast.tool.agg.entity_aligner import EntityAligner
 from ontocast.tool.cache import Cacher
 from ontocast.tool.graph_diff import DiffTool
 from ontocast.tool.graph_version_manager import GraphVersionManager
@@ -174,6 +175,7 @@ class ToolBox:
             embedding_model=tool_config.aggregation.embedding_model,
             similarity_threshold=tool_config.aggregation.similarity_threshold,
         )
+        self._entity_aligners: dict[tuple[str, float], EntityAligner] = {}
 
         # SPARQL, version management, and diff tools
         self.sparql_tool: SPARQLTool = SPARQLTool(
@@ -182,7 +184,7 @@ class ToolBox:
         self.version_manager: GraphVersionManager = GraphVersionManager()
         self.diff_tool: DiffTool = DiffTool()
 
-        self.embedding_tool: EmbeddingTool | None = None
+        self.embedding_tool: EmbeddingTool = EmbeddingTool.create(tool_config.embedding)
         self.vector_store: QdrantVectorStore | None = None
         self.patch_retriever: OntologyPatchRetriever | None = None
         self.vector_store_ready: bool = False
@@ -197,7 +199,6 @@ class ToolBox:
                     "EmbeddingConfig.dimension when set "
                     f"(got vector_size={q_vs}, embedding.dimension={emb_dim})"
                 )
-            self.embedding_tool = EmbeddingTool.create(tool_config.embedding)
             # BM25 is always enabled whenever vector search is enabled.
             sparse_embedding = FastembedBm25SparseTool(config=tool_config.embedding)
             self.vector_store = QdrantVectorStore(
@@ -212,21 +213,40 @@ class ToolBox:
             )
             self.ontology_manager.register_vector_store(self.patch_retriever)
 
+    def get_entity_aligner(
+        self,
+        embedding_model: str | None = None,
+        similarity_threshold: float | None = None,
+    ) -> EntityAligner:
+        """Return a cached entity aligner for the given embedding settings."""
+        tool_config = self.config.get_tool_config()
+        model = embedding_model or tool_config.aggregation.embedding_model
+        threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else tool_config.aggregation.similarity_threshold
+        )
+        cache_key = (model, threshold)
+        aligner = self._entity_aligners.get(cache_key)
+        if aligner is None:
+            aligner = EntityAligner(
+                embedding_model=model,
+                similarity_threshold=threshold,
+            )
+            self._entity_aligners[cache_key] = aligner
+        return aligner
+
     async def get_llm_tool(self, budget_tracker):
-        """Get an LLM tool instance with a specific budget tracker.
+        """Return the shared LLM tool with the given budget tracker attached.
 
         Args:
             budget_tracker: The budget tracker instance to use.
 
         Returns:
-            LLMTool: LLM tool with the specified budget tracker.
+            LLMTool: Shared LLM tool with the specified budget tracker.
         """
-        # Create a new LLM tool with the budget tracker
-        return await LLMTool.acreate(
-            config=self.config.tool_config.llm_config,
-            cache=self.shared_cache,
-            budget_tracker=budget_tracker,
-        )
+        self.llm.budget_tracker = budget_tracker
+        return self.llm
 
     def require_triple_store_manager(self) -> TripleStoreManager:
         """Return the configured triple store manager or raise a clear error."""
@@ -502,7 +522,11 @@ class ToolBox:
             ver = o.version or "0.0.0"
             safe_name = f"ontology_{oid}_{ver}.ttl"
         dest = ontology_dir / safe_name
-        await asyncio.to_thread(dest.write_bytes, ttl)
+
+        def _write_synced_ttl() -> None:
+            o.graph.serialize(format="turtle", destination=dest)
+
+        await asyncio.to_thread(_write_synced_ttl)
         await self._materialize_ontology(o)
         self.ontology_manager.add_ontology(o, skip_vector_index=True)
         return o
@@ -573,6 +597,8 @@ async def render_ontology_summary(ontology: Ontology, llm_tool) -> OntologyPrope
     Returns:
         OntologyProperties: A structured summary containing only the missing properties.
     """
+    from typing import Any, cast
+
     from pydantic import create_model
 
     # Sample the graph intelligently (first 100 sections)
@@ -602,7 +628,7 @@ async def render_ontology_summary(ontology: Ontology, llm_tool) -> OntologyPrope
         return OntologyProperties()
 
     # Create a dynamic model with only unset fields
-    DynamicProps = create_model("DynamicOntologyProps", **unset_fields)
+    DynamicProps = create_model("DynamicOntologyProps", **cast(Any, unset_fields))
 
     # Define the output parser
     parser = PydanticOutputParser(pydantic_object=DynamicProps)
